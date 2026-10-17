@@ -1,0 +1,4 @@
+/maxwell
+/.cache/
+*.fasl
+*.image
