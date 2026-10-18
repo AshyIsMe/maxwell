@@ -24,6 +24,9 @@
            #:request-image
            #:save-image
            #:workspace-path
+           #:zoom
+           #:date
+           #:*chat*
            #:*agent*
            #:agent-history
            #:agent-workspace
