@@ -491,6 +491,191 @@
     (declare (ignore output error-output))
     (check (= 1 status))))
 
+(defun temporary-test-path (name)
+  (merge-pathnames (format nil "maxwell-test-~A-~A.json" name (maxwell::random-value 6))
+                   (uiop:temporary-directory)))
+
+(defun signals-message-p (thunk &rest fragments)
+  "True when THUNK signals an error whose text contains every one of FRAGMENTS."
+  (handler-case (progn (funcall thunk) nil)
+    (error (condition)
+      (let ((text (princ-to-string condition)))
+        (every (lambda (fragment) (search fragment text)) fragments)))))
+
+(defun test-safeai-credentials ()
+  (let ((maxwell::*safeai-auth-file* nil))
+    ;; MAXWELL_SAFEAI_AUTH_FILE overrides the default location.
+    (check (equal (pathname "/elsewhere/key.json")
+                  (maxwell::safeai-auth-file-path
+                    (lambda (name)
+                      (and (string= name "MAXWELL_SAFEAI_AUTH_FILE")
+                           "/elsewhere/key.json")))))
+    (let ((default (namestring (maxwell::safeai-auth-file-path (constantly nil)))))
+      (check (search "maxwell/safeai-auth.json" default))))
+  (let* ((path (temporary-test-path "safeai-auth"))
+         (maxwell::*safeai-auth-file* path))
+    (unwind-protect
+         (progn
+           (check (signals-message-p
+                    (lambda () (maxwell::safeai-api-key :environment (constantly nil)))
+                    "/login safeai"))
+           (maxwell::write-private-json-file
+             (maxwell/json:json-object "api_key" "sail_saved" "model" "saved/model")
+             path)
+           (check (string= "sail_saved"
+                           (maxwell::safeai-api-key :environment (constantly nil))))
+           ;; SAFEAILABS_API_KEY takes precedence over the saved key.
+           (check (string= "sail_env"
+                           (maxwell::safeai-api-key
+                             :environment (lambda (name)
+                                            (and (string= name "SAFEAILABS_API_KEY")
+                                                 "sail_env")))))
+           (unless (maxwell::environment-value "SAFEAILABS_API_KEY")
+             (check (string= "sail_saved"
+                             (maxwell::client-authorization-token
+                               (maxwell:make-client :auth-provider :safeai)))))
+           (check (maxwell::forget-safeai-login))
+           (check (not (probe-file path)))
+           (check (not (maxwell::forget-safeai-login))))
+      (when (probe-file path) (delete-file path)))))
+
+(defun test-safeai-key-checks ()
+  (check (maxwell::safeai-key-problem ""))
+  (check (maxwell::safeai-key-problem "sail_ab cd"))
+  (check (maxwell::safeai-key-problem (format nil "sail_ab~Ccd" #\Newline)))
+  (check (null (maxwell::safeai-key-problem "sail_abcd")))
+  (check (null (maxwell::safeai-key-check-message "200" "{\"data\":[]}")))
+  (let ((message (maxwell::safeai-key-check-message
+                   "401" "{\"error\":{\"code\":\"invalid_api_key\",\"message\":\"no\"}}")))
+    (check (search "rejected" message))
+    (check (search "invalid_api_key" message))
+    (check (search "https://safeailabs.ai/keys" message)))
+  (let ((message (maxwell::safeai-key-check-message
+                   "403" "{\"error\":{\"code\":\"sail_key_requires_sail\"}}")))
+    (check (search "Sail" message))
+    (check (search "https://safeailabs.ai/keys" message)))
+  ;; The Sail-only code is recognised even in a body that is not JSON.
+  (check (search "Sail" (maxwell::safeai-key-check-message
+                          "403" "error: sail_key_requires_sail")))
+  (check (search "refused" (maxwell::safeai-key-check-message "403" "")))
+  (check (search "HTTP 500" (maxwell::safeai-key-check-message "500" "oops")))
+  (check (search "Could not reach"
+                 (maxwell::safeai-key-check-message "000" "" 6))))
+
+(defun test-private-credential-header ()
+  ;; The bearer token travels in an owner-only file, never on the command line.
+  (multiple-value-bind (arguments files) (maxwell::bearer-header-arguments "secret-token")
+    (check (= 1 (length files)))
+    (check (notany (lambda (argument) (search "secret-token" argument)) arguments))
+    (check (string= (format nil "@~A" (namestring (car (first files))))
+                    (second arguments)))
+    (multiple-value-bind (output error-output status)
+        (maxwell::run-command (list "cat" (namestring (car (first files))))
+                              :private-files files)
+      (declare (ignore error-output))
+      (check (zerop status))
+      (check (string= (format nil "Authorization: Bearer secret-token~%") output)))
+    (check (not (probe-file (car (first files))))))
+  (multiple-value-bind (arguments files) (maxwell::bearer-header-arguments nil)
+    (check (null arguments))
+    (check (null files)))
+  (check (signals-message-p
+           (lambda () (maxwell::bearer-header-arguments (format nil "a~%b")))
+           "line break"))
+  ;; Asynchronous jobs delete their private files when collected.
+  (let* ((path (maxwell::private-temporary-path "test"))
+         (job (maxwell::start-command (list "cat" (namestring path))
+                                      :private-files (list (cons path "async")))))
+    (check (string= "async" (maxwell::finish-command job)))
+    (check (not (probe-file path)))))
+
+(defun test-provider-presets ()
+  (let* ((session (temporary-test-path "preset-session"))
+         (auth (temporary-test-path "preset-safeai"))
+         (maxwell::*session-file* session)
+         (maxwell::*safeai-auth-file* auth))
+    (unwind-protect
+         (flet ((resolve (&rest arguments)
+                  (apply #'maxwell::resolve-client-options
+                         (append arguments (list :environment (constantly nil))))))
+           ;; --auth openai alone is the complete ChatGPT-plan preset.
+           (let* ((options (resolve :auth-provider "openai"))
+                  (client (apply #'maxwell:make-client options))
+                  (fields (maxwell::client-request-fields client)))
+             (check (eq :openai (getf options :auth-provider)))
+             (check (string= "gpt-5.6-sol" (getf options :model)))
+             (check (string= "https://api.openai.com/v1" (maxwell:client-base-url client)))
+             (check (eq :responses (maxwell:client-wire-api client)))
+             (check (eq t (maxwell/json:get-key fields "stream")))
+             (check (null (maxwell/json:get-key fields "store"))))
+           (check (string= "explicit"
+                           (getf (resolve :auth-provider "openai" :model "explicit")
+                                 :model)))
+           (check (string= "codex-env"
+                           (getf (maxwell::resolve-client-options
+                                   :auth-provider "OpenAI"
+                                   :environment
+                                   (lambda (name)
+                                     (cond ((string= name "MAXWELL_CODEX_MODEL") "codex-env")
+                                           ((string= name "MAXWELL_MODEL") "generic"))))
+                                 :model)))
+           ;; --auth safeai before any login uses the regional endpoint.
+           (let ((options (resolve :auth-provider "safeai")))
+             (check (eq :safeai (getf options :auth-provider)))
+             (check (string= "https://us-region.api.safeailabs.ai/v1"
+                             (getf options :base-url)))
+             (check (eq :chat-completions (getf options :wire-api)))
+             (check (string= "SAFEAILABS_API_KEY" (getf options :api-key-environment)))
+             (check (string= "" (getf options :model))))
+           ;; After a login, the saved endpoint and model become the defaults.
+           (maxwell::write-private-json-file
+             (maxwell/json:json-object "api_key" "sail_k"
+                                       "base_url" "https://gbl.api.safeailabs.ai/v1"
+                                       "model" "deepseek/deepseek-v4.1-flash")
+             auth)
+           (let ((options (resolve :auth-provider "safeai")))
+             (check (string= "https://gbl.api.safeailabs.ai/v1" (getf options :base-url)))
+             (check (string= "deepseek/deepseek-v4.1-flash" (getf options :model))))
+           (let ((options (maxwell::resolve-client-options
+                            :auth-provider "safeai"
+                            :environment
+                            (lambda (name)
+                              (cond ((string= name "MAXWELL_SAFEAI_MODEL") "env/model")
+                                    ((string= name "MAXWELL_SAFEAI_BASE_URL")
+                                     "https://safeai.example/v1")
+                                    ((string= name "MAXWELL_MODEL") "generic"))))))
+             (check (string= "env/model" (getf options :model)))
+             (check (string= "https://safeai.example/v1" (getf options :base-url))))
+           (check (signals-message-p (lambda () (resolve :auth-provider "nope"))
+                                     "openai" "safeai"))
+           ;; A Safe AI Labs session is remembered and continued by a bare start,
+           ;; without its key ever reaching session.json.
+           (maxwell::remember-client
+             (apply #'maxwell:make-client (resolve :auth-provider "safeai")))
+           (let ((provider (maxwell/json:get-key (maxwell::load-session-record)
+                                                 "provider")))
+             (check (string= "safeai" (maxwell/json:get-key provider "auth_provider"))))
+           (check (not (search "sail_k" (uiop:read-file-string session))))
+           (let ((client (apply #'maxwell:make-client (resolve))))
+             (check (eq :safeai (maxwell::client-auth-provider client)))
+             (check (string= "https://gbl.api.safeailabs.ai/v1"
+                             (maxwell:client-base-url client)))
+             (check (eq :chat-completions (maxwell:client-wire-api client)))
+             (check (string= "deepseek/deepseek-v4.1-flash"
+                             (maxwell:client-model client))))
+           ;; Adopting Safe AI Labs drops the ChatGPT plan's request contract.
+           (let ((client (maxwell::adopt-safeai-client
+                           (maxwell:make-client :auth-provider :openai :model "x")
+                           "picked/model")))
+             (check (eq :safeai (maxwell::client-auth-provider client)))
+             (check (eq :chat-completions (maxwell:client-wire-api client)))
+             (check (null (maxwell::client-request-fields client)))
+             (check (string= "picked/model"
+                             (maxwell/json:get-key (maxwell::load-session-record)
+                                                   "model")))))
+      (dolist (path (list session auth))
+        (when (probe-file path) (delete-file path))))))
+
 (defun run-tests ()
   ;; Tests may be run by the live agent through COMMON_LISP.
   (let ((maxwell:*agent* nil)
@@ -500,6 +685,9 @@
         ;; Never touch the real remembered session while testing.
         (maxwell::*session-file*
           (merge-pathnames "maxwell-test-session-unused.json"
+                           (uiop:temporary-directory)))
+        (maxwell::*safeai-auth-file*
+          (merge-pathnames "maxwell-test-safeai-unused.json"
                            (uiop:temporary-directory))))
     (setf *failures* 0)
     (test-json)
@@ -513,6 +701,10 @@
     (test-openai-client-contract)
     (test-model-catalog)
     (test-session-memory)
+    (test-safeai-credentials)
+    (test-safeai-key-checks)
+    (test-private-credential-header)
+    (test-provider-presets)
     (test-steering-input)
     (test-steering-run)
     (test-async-command)

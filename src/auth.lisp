@@ -623,3 +623,154 @@
                (> expires-at (+ (unix-time) 300)))
           token
           (refresh-openai-token record)))))
+
+(defun forget-openai-login (&optional (path (auth-file-path)))
+  "Remove the saved ChatGPT tokens. The host ID and issued client ID stay, so a
+later login registers as the same Maxwell installation."
+  (let ((record (load-auth-record path)))
+    (when record
+      (dolist (field '("id_token" "access_token" "refresh_token" "scope"
+                       "expires_at" "subject" "issuer" "email"))
+        (remhash field record))
+      (save-auth-record record path)
+      t)))
+
+;;; Safe AI Labs offers no OAuth for third-party clients; its own web sign-in
+;;; issues keys that work only from its Sail CLI. Maxwell therefore uses a
+;;; browser-assisted API-key login: it opens the key page, the user creates a
+;;; key there and pastes it, and Maxwell verifies and saves it owner-only.
+
+(defparameter +safeai-keys-url+ "https://safeailabs.ai/keys")
+(defparameter +safeai-base-url+ "https://us-region.api.safeailabs.ai/v1")
+(defparameter +safeai-api-key-environment+ "SAFEAILABS_API_KEY")
+
+(defvar *safeai-auth-file* nil
+  "When non-NIL, the file holding the saved Safe AI Labs API key.")
+
+(defun safeai-auth-file-path (&optional (environment #'environment-value))
+  "The owner-only file holding the Safe AI Labs API key saved by --login safeai."
+  (or *safeai-auth-file*
+      (let ((value (funcall environment "MAXWELL_SAFEAI_AUTH_FILE")))
+        (and value (pathname value)))
+      (merge-pathnames "maxwell/safeai-auth.json" (config-directory))))
+
+(defun load-safeai-auth-record (&optional (path (safeai-auth-file-path)))
+  (load-auth-record path))
+
+(defun safeai-api-key (&key (environment #'environment-value)
+                            (path (safeai-auth-file-path)))
+  "The Safe AI Labs API key: SAFEAILABS_API_KEY when set, else the saved login."
+  (or (funcall environment +safeai-api-key-environment+)
+      (let ((key (get-key (or (load-safeai-auth-record path) (json-object))
+                          "api_key")))
+        (and (stringp key) (plusp (length key)) key))
+      (error "Maxwell has no Safe AI Labs API key. Run /login safeai or maxwell --login safeai.")))
+
+(defun safeai-key-problem (key)
+  "A reason KEY cannot be an API key, or NIL. Keys travel in an HTTP header, so
+anything but visible ASCII is refused outright."
+  (cond
+    ((zerop (length key)) "No API key was entered.")
+    ((notevery (lambda (character) (char< #\Space character (code-char 127))) key)
+     "The API key contains spaces or characters that cannot appear in a key.")))
+
+(defun safeai-response-code (body)
+  "The error code in a Safe AI Labs error BODY, or NIL."
+  (let* ((json (ignore-errors (decode body)))
+         (error-object (and (hash-table-p json) (get-key json "error")))
+         (code (cond ((hash-table-p error-object) (get-key error-object "code"))
+                     ((hash-table-p json) (get-key json "code")))))
+    (and (stringp code) code)))
+
+(defun safeai-key-check-message (http-status body &optional (curl-status 0))
+  "Explain why verifying a Safe AI Labs key failed, or return NIL when the
+HTTP-STATUS of GET /models shows the key works."
+  (let ((code (or (safeai-response-code body)
+                  (and (search "sail_key_requires_sail" body)
+                       "sail_key_requires_sail"))))
+    (cond
+      ((not (zerop curl-status))
+       (format nil "Could not reach Safe AI Labs (curl exit status ~A)." curl-status))
+      ((and (= (length http-status) 3) (char= (char http-status 0) #\2)) nil)
+      ((equal code "sail_key_requires_sail")
+       (format nil "That key belongs to the Sail CLI and works only from Sail. Create an API key at ~A and paste that instead."
+               +safeai-keys-url+))
+      ((string= http-status "401")
+       (format nil "Safe AI Labs rejected the key~@[ (~A)~]. Copy the complete key from ~A and try again."
+               code +safeai-keys-url+))
+      ((string= http-status "403")
+       (format nil "Safe AI Labs refused the key~@[ (~A)~]. Check its permissions at ~A."
+               code +safeai-keys-url+))
+      ((string= http-status "000")
+       "Could not reach Safe AI Labs.")
+      (t
+       (format nil "Safe AI Labs returned HTTP ~A~@[ (~A)~] while checking the key."
+               http-status code)))))
+
+(defun read-secret-line (prompt)
+  "Read a line after PROMPT without echoing it when standard input is a terminal."
+  (format t "~A" prompt)
+  (finish-output)
+  (let ((state (interactive-terminal-state)))
+    (prog1 (if state
+               (unwind-protect
+                    (progn
+                      (terminal-command "-echo")
+                      (read-line *standard-input* nil nil))
+                 (terminal-command state))
+               (read-line *standard-input* nil nil))
+      ;; Neither the line nor its Enter was echoed.
+      (terpri)
+      (finish-output))))
+
+(defun safeai-base-url (&optional (environment #'environment-value))
+  (or (funcall environment "MAXWELL_SAFEAI_BASE_URL") +safeai-base-url+))
+
+(defun safeai-login ()
+  "Open the Safe AI Labs key page, read a pasted API key, verify it, and save it
+owner-only. Returns the model to use: MAXWELL_SAFEAI_MODEL or the first listed."
+  (if (manual-oauth-p)
+      (format t "~&Open this page on your local computer and sign in:~%~A~%"
+              +safeai-keys-url+)
+      (progn
+        (format t "~&Opening Safe AI Labs in your browser. If it does not open, visit:~%~A~%"
+                +safeai-keys-url+)
+        (finish-output)
+        (open-browser +safeai-keys-url+)))
+  (format t "~%Create an API key there (it starts with sail_), copy it, and paste it below.~%")
+  (let* ((input (or (read-secret-line "API key (hidden): ")
+                    (error "No API key was entered.")))
+         (key (string-trim '(#\Space #\Tab #\Return #\Newline) input))
+         (base-url (safeai-base-url)))
+    (let ((problem (safeai-key-problem key)))
+      (when problem (error problem)))
+    (unless (uiop:string-prefix-p "sail_" key)
+      (format t "Warning: Safe AI Labs API keys normally start with sail_.~%"))
+    (format t "Checking the key with ~A ...~%" base-url)
+    (finish-output)
+    (multiple-value-bind (body http-status curl-status)
+        (fetch-models-response base-url key)
+      (let ((problem (safeai-key-check-message http-status body curl-status)))
+        (when problem (error problem)))
+      (let ((model (or (environment-value "MAXWELL_SAFEAI_MODEL")
+                       (car (first (model-catalog-from-body body)))
+                       (error "Safe AI Labs listed no models. Set MAXWELL_SAFEAI_MODEL.")))
+            (path (safeai-auth-file-path)))
+        (write-private-json-file
+          (json-object "api_key" key
+                       "base_url" base-url
+                       "model" model
+                       "saved_at" (unix-time))
+          path)
+        (format t "Safe AI Labs key verified. Saved to ~A.~%" path)
+        (let ((environment-key (environment-value +safeai-api-key-environment+)))
+          (when (and environment-key (string/= environment-key key))
+            (format t "Note: ~A is set and takes precedence over the saved key.~%"
+                    +safeai-api-key-environment+)))
+        model))))
+
+(defun forget-safeai-login (&optional (path (safeai-auth-file-path)))
+  "Delete the saved Safe AI Labs key. True when there was one."
+  (when (probe-file path)
+    (delete-file path)
+    t))

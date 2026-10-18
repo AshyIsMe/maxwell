@@ -298,7 +298,35 @@
 (defun client-authorization-token (client)
   (case (client-auth-provider client)
     (:openai (openai-access-token))
+    (:safeai (safeai-api-key))
     (otherwise (uiop:getenv (client-api-key-environment client)))))
+
+(defun bearer-header-arguments (token)
+  "The curl arguments that send TOKEN as a bearer credential, and the private
+files they read. The header goes through an owner-only file rather than the
+command line, where any local user could read it with ps."
+  (cond
+    ((or (null token) (zerop (length token)))
+     (values '() '()))
+    ((find-if (lambda (character) (member character '(#\Return #\Newline))) token)
+     ;; A line break would let the credential inject further headers.
+     (error 'provider-error :message "The API credential contains a line break."))
+    (t
+     (let ((path (private-temporary-path "header")))
+       (values (list "--header" (format nil "@~A" (namestring path)))
+               (list (cons path (format nil "Authorization: Bearer ~A~%" token))))))))
+
+(defun split-http-status (output)
+  "Split curl OUTPUT, written with --write-out \"\\n%{http_code}\", into the
+response body and the three-character HTTP status (\"000\" when none)."
+  (let ((newline (position #\Newline output :from-end t)))
+    (values (if newline (subseq output 0 newline) output)
+            (if newline (subseq output (1+ newline)) "000"))))
+
+(defun success-status-p (curl-status http-status)
+  (and (zerop curl-status)
+       (= (length http-status) 3)
+       (char= (char http-status 0) #\2)))
 
 (defun model-catalog-from-response (response)
   (let ((openai-models (get-key response "models"))
@@ -319,68 +347,76 @@
        (error 'provider-error
               :message "Provider model response has neither a models nor data array.")))))
 
+(defun fetch-models-response (base-url token &key extra-headers (timeout 60))
+  "GET BASE-URL/models, authorized by TOKEN when it is non-NIL. Returns the
+response body, the HTTP status as a string (\"000\" when curl failed), curl's
+exit status, and curl's error output."
+  (multiple-value-bind (authorization private-files) (bearer-header-arguments token)
+    (multiple-value-bind (output error-output status)
+        (run-command
+          (append (list "curl" "--silent" "--show-error" "--location"
+                        "--max-time" (write-to-string timeout))
+                  authorization
+                  (loop for header in extra-headers
+                        append (list "--header" header))
+                  (list "--write-out" (format nil "~%%{http_code}")
+                        (format nil "~A/models" (trim-slashes base-url))))
+          :private-files private-files)
+      (multiple-value-bind (body http-status) (split-http-status output)
+        (values body http-status status error-output)))))
+
+(defun model-catalog-from-body (body)
+  "The (ID . DISPLAY-NAME) pairs in the model catalog JSON BODY."
+  (handler-case (model-catalog-from-response (decode body))
+    (provider-error (condition) (error condition))
+    (error (condition)
+      (error 'provider-error
+             :message (format nil "Provider returned an invalid model catalog: ~A"
+                              condition)))))
+
 (defun list-provider-models (client)
   "Return available models as (ID . DISPLAY-NAME) pairs in provider order."
-  (let* ((key (client-authorization-token client))
-         (url (format nil "~A/models" (trim-slashes (client-base-url client))))
-         (arguments
-           (append (list "curl" "--silent" "--show-error" "--location"
-                         "--max-time" (write-to-string (client-timeout client)))
-                   (when (and key (plusp (length key)))
-                     (list "--header" (format nil "Authorization: Bearer ~A" key)))
-                   (loop for header in (client-extra-headers client)
-                         append (list "--header" header))
-                   (list "--write-out" (format nil "~%%{http_code}") url))))
-    (multiple-value-bind (output error-output status)
-        (run-command arguments)
-      (let* ((newline (position #\Newline output :from-end t))
-             (response-body (if newline (subseq output 0 newline) output))
-             (http-status (if newline (subseq output (1+ newline)) "000")))
-        (unless (and (zerop status) (= (length http-status) 3)
-                     (char= (char http-status 0) #\2))
-          (error 'provider-error
-                 :message (response-error-message response-body
-                                                  (if (zerop status) http-status status)
-                                                  error-output)))
-        (handler-case
-            (model-catalog-from-response (decode response-body))
-          (provider-error (condition) (error condition))
-          (error (condition)
-            (error 'provider-error
-                   :message (format nil "Provider returned an invalid model catalog: ~A"
-                                    condition))))))))
+  (multiple-value-bind (body http-status status error-output)
+      (fetch-models-response (client-base-url client)
+                             (client-authorization-token client)
+                             :extra-headers (client-extra-headers client)
+                             :timeout (client-timeout client))
+    (unless (success-status-p status http-status)
+      (error 'provider-error
+             :message (response-error-message body
+                                              (if (zerop status) http-status status)
+                                              error-output)))
+    (model-catalog-from-body body)))
 
 (defun provider-request-arguments (client request)
   "The curl arguments and request body that POST REQUEST to CLIENT's provider.
-The third value is true when the reply is a Responses API event stream."
-  (let* ((streaming (streaming-responses-request-p client request))
-         (key (client-authorization-token client))
-         (url (provider-url client)))
-    (values
-      (append (list "curl" "--silent" "--show-error" "--location"
-                    "--max-time" (write-to-string (client-timeout client))
-                    "--header" "Content-Type: application/json")
-              (when streaming
-                (list "--no-buffer" "--header" "Accept: text/event-stream"))
-              (when (and key (plusp (length key)))
-                (list "--header" (format nil "Authorization: Bearer ~A" key)))
-              (loop for header in (client-extra-headers client)
-                    append (list "--header" header))
-              (list "--data-binary" "@-"
-                    "--write-out" (format nil "~%%{http_code}")
-                    url))
-      (encode request)
-      streaming)))
+The third value is true when the reply is a Responses API event stream; the
+fourth lists the private files, holding the credential, that the arguments read."
+  (let ((streaming (streaming-responses-request-p client request))
+        (url (provider-url client)))
+    (multiple-value-bind (authorization private-files)
+        (bearer-header-arguments (client-authorization-token client))
+      (values
+        (append (list "curl" "--silent" "--show-error" "--location"
+                      "--max-time" (write-to-string (client-timeout client))
+                      "--header" "Content-Type: application/json")
+                (when streaming
+                  (list "--no-buffer" "--header" "Accept: text/event-stream"))
+                authorization
+                (loop for header in (client-extra-headers client)
+                      append (list "--header" header))
+                (list "--data-binary" "@-"
+                      "--write-out" (format nil "~%%{http_code}")
+                      url))
+        (encode request)
+        streaming
+        private-files))))
 
 (defun parse-provider-output (output error-output status streaming)
   "Decode the reply curl printed for a provider request, or signal a
 PROVIDER-ERROR. STATUS is curl's exit status."
-  (let* ((newline (position #\Newline output :from-end t))
-         (response-body (if newline (subseq output 0 newline) output))
-         (http-status (if newline (subseq output (1+ newline)) "000")))
-    (unless (and (zerop status)
-                 (= (length http-status) 3)
-                 (char= (char http-status 0) #\2))
+  (multiple-value-bind (response-body http-status) (split-http-status output)
+    (unless (success-status-p status http-status)
       (error 'provider-error
              :message (response-error-message response-body
                                               (if (zerop status) http-status status)
@@ -396,13 +432,13 @@ PROVIDER-ERROR. STATUS is curl's exit status."
                                 condition response-body))))))
 
 (defun post-provider (client request)
-  (multiple-value-bind (arguments body streaming)
+  (multiple-value-bind (arguments body streaming private-files)
       (provider-request-arguments client request)
     ;; The request body goes to the child's standard input. At the prompt the
     ;; child runs asynchronously so the user can still browse the transcript
     ;; and queue steering prompts while the model works.
     (multiple-value-bind (output error-output status)
-        (run-command arguments :input body)
+        (run-command arguments :input body :private-files private-files)
       (parse-provider-output output error-output status streaming))))
 
 (defun require-model (client)
@@ -428,9 +464,10 @@ PROVIDER-ERROR. STATUS is curl's exit status."
   "Start a request for MESSAGES and TOOLS without waiting for the reply.
 Returns a PROVIDER-JOB to poll with PROVIDER-REQUEST-FINISHED-P."
   (require-model client)
-  (multiple-value-bind (arguments body streaming)
+  (multiple-value-bind (arguments body streaming private-files)
       (provider-request-arguments client (provider-request-object client messages tools))
-    (%make-provider-job :command (start-command arguments :input body)
+    (%make-provider-job :command (start-command arguments :input body
+                                                          :private-files private-files)
                         :wire-api (client-wire-api client)
                         :streaming streaming)))
 
