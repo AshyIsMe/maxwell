@@ -7,9 +7,9 @@ only model-visible tool is a live Common Lisp evaluator.
 
 Every tool call runs in the same SBCL process and the same
 `MAXWELL/WORKSPACE` package. Definitions, loaded ASDF systems, caches, and any
-other Lisp state survive from one call to the next. SBCL can checkpoint the
-whole harness—including the conversation and that live state—as a resumable
-executable image.
+other Lisp state survive from one call to the next. The conversation is one
+chat that never ends, across every project, and it lives with that Lisp state
+in a single executable SBCL image that Maxwell checkpoints itself into.
 
 ## Run it
 
@@ -191,15 +191,22 @@ Maxwell waits for `response.completed`, then feeds that complete response into
 the same tool loop used for non-streaming responses. Failed, incomplete, or
 truncated streams are reported as provider errors.
 
+Memory summaries are written by the same provider. `--compact-model MODEL` (or
+`MAXWELL_COMPACT_MODEL`) picks a cheaper model for them; it is remembered with
+the provider. Without it Maxwell uses the main model and says once that this
+may cost more.
+
 Use repeated `--header 'Name: value'` flags for gateway-specific headers. Use
 `--request-json '{"temperature":0.2}'` for provider-specific request fields;
 Maxwell always supplies the model, conversation, and tools itself. A compatible
 model must support function/tool calling for the coding loop to operate.
 
-One-shot mode:
+One-shot mode continues the same chat and saves it; `--ephemeral` gives a
+throwaway chat instead, for scripting:
 
 ```sh
 sbcl --script maxwell.lisp --print "Explain this project"
+maxwell --ephemeral --print "What is 2 + 2?"
 ```
 
 Build a standalone executable and run the tests:
@@ -210,32 +217,88 @@ make build
 ./maxwell --model gpt-5
 ```
 
-Terminal behaviour is covered by two pty tests that drive the built executable:
-`python3 tests/terminal-pty.py` for editing, history, and settings restoration,
-and `python3 tests/terminal-pty-steering.py` for browsing and steering during a
-request (it serves a deliberately slow fake provider on a local port).
+Terminal behaviour is covered by pty tests that drive the built executable:
+`python3 tests/terminal-pty.py` for editing, history, Ctrl-T, colour, and
+settings restoration; `python3 tests/terminal-pty-steering.py` for browsing and
+steering during a request (it serves a deliberately slow fake provider on a
+local port); and `python3 tests/checkpoint-pty.py` for saving, restarting, the
+lock, and moving the chat between builds. All of them keep their images,
+sessions, and logins in a temporary directory.
 
-## Images
+## Memory: one endless chat
 
-At the prompt, `/save maxwell.image` writes a resumable executable and exits.
-Start that file later to continue with the same conversation and Lisp state:
+Maxwell keeps every message—yours, its replies, its tool calls and their
+results—in an append-only log, following VictorTaelin's
+[UniiChat/OptMem design](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449).
+A background compactor folds the log into a binary tree of one-line summaries
+of at most 512 bytes. Each turn shows the model a *view* of 64–128 KB: recent
+messages one per line, older ones merged, every line tagged with its project
+(the git root of the workspace it came from):
 
-```sh
-./maxwell.image
+```text
+<chat>
+0+64|[maxwell] user: asked for colour ...; maxwell: added style.lisp ...
+...
+1280+1|[dotfiles] user: switch the prompt to fish
+</chat>
 ```
 
-The agent itself can schedule the same operation by evaluating:
+A turn is `[system prompt][view][turn state + your message]`. The system prompt
+and the old part of the view do not change from turn to turn, so providers can
+cache them. No other conversation carries over: within a turn the model sees
+whole tool results, but the log keeps at most 30,000 characters of each.
 
-```lisp
-(maxwell:request-image "maxwell.image")
-```
+The model reads further through its one tool: `(maxwell:zoom id n)` opens line
+`id+n` into the two lines it was made from, `(maxwell:zoom id 1)` returns
+message `id` whole, and `(maxwell:date id)` gives its time. A turn waits, with
+a spinner on the steering line, until everything before your message has a
+summary; Ctrl-C sends it without waiting. If summaries cannot be built, for
+example because the provider is failing, the turn goes ahead with the view so
+far and says so.
 
-The save happens only after the model finishes its current run, avoiding a
-half-recorded tool call. The configured API key is read from its environment
-variable, or the saved login from its credential file, for each request and is
-not stored in the image. Custom header values
-*are* part of client state, so do not put secrets in `--header` if you intend to
-save an image.
+Summary requests run as background `curl` processes, up to 8 at once, polled
+between keystrokes and between tool calls. A project's `AGENTS.md` is read into
+memory at the first turn in it, and again whenever it changes. `/import PATH`
+does the same for any file. `/memory` shows the message count, the tree, the
+view's size, and the compactor's jobs.
+
+## The global image
+
+The chat lives in one executable image,
+`${XDG_DATA_HOME:-~/.local/share}/maxwell/maxwell.image` (override it with
+`MAXWELL_IMAGE`). The built `./maxwell`, `sbcl --script maxwell.lisp`, or any
+other image starts by exec'ing it with the same arguments, so every session
+continues the same chat and Lisp state; until it exists, Maxwell starts empty.
+`--fresh` runs the binary or image you named instead; when it saves, its chat
+replaces the global one.
+
+Maxwell saves itself on `/quit`, Ctrl-D, after `--print`, and on `/checkpoint`,
+which keeps the session going: a forked child writes `maxwell.image.tmp` next
+to the image and the parent `fsync`s it and renames it into place, so a crash
+loses at most the current session. If `fork` fails, Maxwell saves and exits
+instead, and the new image replaces the old one once it is complete. An
+exclusive lock on `maxwell.lock` admits one Maxwell at a time; a second exits
+with a message. `--ephemeral` never reads, locks, or writes the global image.
+
+To run new Maxwell code with the chat:
+
+- `/reload` loads the source tree the binary was built from into the running
+  session with ASDF, then saves. This is the usual way.
+- `maxwell --adopt-chat`, run with a new build, starts the global image with
+  `--export-chat`, reads the chat it prints as plain s-expressions through a
+  pipe (with `*read-eval*` off), and saves the new build with it as the global
+  image.
+
+`/save PATH`, or `(maxwell:request-image "path")` from the agent, still writes
+a separate snapshot and exits after saving the global chat; the agent's request
+waits until its turn ends. Start a snapshot with `--fresh`, or it hands over to
+the global image.
+
+API keys are read from their environment variable, and logins from their
+credential file, for each request; neither is held in the image. Custom header
+values *are* part of client state, so do not put secrets in `--header`: the
+image is saved automatically. The image holds the whole chat and is written
+owner-only.
 
 ## Deliberate limits
 
@@ -243,7 +306,7 @@ save an image.
 - Two wire shapes: compatible Chat Completions by default, Responses when
   explicitly selected.
 - One model-visible tool: `common_lisp`.
-- One linear, in-memory conversation. Persist it with the Lisp image.
+- One endless chat, compressed into a view, kept in one global image.
 - No sandbox. Evaluated Lisp has the permissions of the Maxwell process.
 - Tool calls are sequential because they mutate one Lisp world.
 
@@ -252,16 +315,32 @@ inspect and adapt itself using its own Lisp tool.
 
 ### Transcript navigation
 
+Tool calls are drawn as a one-line summary with the last lines of their
+result; a green or red bullet shows whether the call succeeded. **Ctrl-T**
+switches every tool call between that summary and the full code and result,
+and redraws the screen, at the prompt, while the model works, or in the
+viewer. Replies are rendered as light markdown, and code in them is
+highlighted (Common Lisp, Rust, JavaScript/TypeScript, C/C++, Go, Java,
+Python, shell, JSON, TOML/YAML, diff).
+
+Colour uses the 16 standard ANSI colours, so your terminal theme decides the
+shades. It is on when output is a terminal, `TERM` is not `dumb`, and
+`NO_COLOR` is unset; `--color always` or `--color never` overrides that.
+Nothing styled reaches the model or the log.
+
 At the interactive prompt, press **Page Up** to open conversation history,
-including tool calls and results. **Page Up / Page Down** move one page at a
-time; **Escape** returns to the prompt. Page Down past the newest page also
-returns. Your unfinished input is preserved. Left/Right, Home/End, Backspace,
-and Delete edit the prompt; long input scrolls horizontally.
+including tool calls and results; scrolling back continues into earlier
+sessions. **Page Up / Page Down** move one page at a time; **Escape** returns
+to the prompt. Page Down past the newest page also returns. Your unfinished
+input is preserved. Left/Right, Home/End, Backspace, and Delete edit the
+prompt; long input scrolls horizontally. Ctrl-C clears the line, or abandons
+a running turn.
 
 This uses an ANSI-compatible terminal and `stty` with `/dev/tty` (currently
 Linux). Redirected input/output and `TERM=dumb` retain ordinary line input.
 The viewer shows conversation messages, not every CLI status line, and terminal
-dimensions are read when it opens.
+dimensions are read when it opens. A resumed chat starts by showing its last
+two exchanges, dimmed.
 
 ### Steering the model while it works
 
@@ -282,8 +361,8 @@ prompt instead of being discarded.
 
 Steering applies while Maxwell waits for the provider and between tool calls. A
 single long tool call runs with the Lisp world locked, so keys pressed during it
-are handled as soon as it finishes — they wait in the terminal buffer and are
-not lost.
+(Ctrl-T too) are handled as soon as it finishes — they wait in the terminal
+buffer and are not lost.
 
 This is done by running `curl` asynchronously and polling the terminal while it
 runs, rather than by evaluating tool calls on a second thread. Tool calls keep
