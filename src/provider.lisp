@@ -5,6 +5,8 @@
   endpoint
   (wire-api :chat-completions :type keyword)
   (model "" :type string)
+  ;; The cheaper model that builds OptChat summaries; NIL means MODEL.
+  compact-model
   (api-key-environment "OPENAI_API_KEY" :type string)
   auth-provider
   (extra-headers '() :type list)
@@ -18,6 +20,7 @@
                       (base-url (or (uiop:getenv "MAXWELL_BASE_URL")
                                     "https://api.openai.com/v1"))
                       (model (or (uiop:getenv "MAXWELL_MODEL") ""))
+                      (compact-model (uiop:getenv "MAXWELL_COMPACT_MODEL"))
                       (api-key-environment
                         (or (uiop:getenv "MAXWELL_API_KEY_ENV")
                             "OPENAI_API_KEY"))
@@ -55,6 +58,9 @@
                 :endpoint endpoint
                 :wire-api (if (eq wire-api :chat) :chat-completions wire-api)
                 :model model
+                :compact-model (and (stringp compact-model)
+                                    (plusp (length compact-model))
+                                    compact-model)
                 :api-key-environment api-key-environment
                 :auth-provider auth-provider
                 :extra-headers extra-headers
@@ -344,54 +350,112 @@
                    :message (format nil "Provider returned an invalid model catalog: ~A"
                                     condition))))))))
 
-(defun post-provider (client request)
+(defun provider-request-arguments (client request)
+  "The curl arguments and request body that POST REQUEST to CLIENT's provider.
+The third value is true when the reply is a Responses API event stream."
   (let* ((streaming (streaming-responses-request-p client request))
          (key (client-authorization-token client))
-         (url (provider-url client))
-         (body (encode request))
-         (arguments
-           (append (list "curl" "--silent" "--show-error" "--location"
-                         "--max-time" (write-to-string (client-timeout client))
-                         "--header" "Content-Type: application/json")
-                   (when streaming
-                     (list "--no-buffer" "--header" "Accept: text/event-stream"))
-                   (when (and key (plusp (length key)))
-                     (list "--header" (format nil "Authorization: Bearer ~A" key)))
-                   (loop for header in (client-extra-headers client)
-                         append (list "--header" header))
-                   (list "--data-binary" "@-"
-                         "--write-out" (format nil "~%%{http_code}")
-                         url))))
+         (url (provider-url client)))
+    (values
+      (append (list "curl" "--silent" "--show-error" "--location"
+                    "--max-time" (write-to-string (client-timeout client))
+                    "--header" "Content-Type: application/json")
+              (when streaming
+                (list "--no-buffer" "--header" "Accept: text/event-stream"))
+              (when (and key (plusp (length key)))
+                (list "--header" (format nil "Authorization: Bearer ~A" key)))
+              (loop for header in (client-extra-headers client)
+                    append (list "--header" header))
+              (list "--data-binary" "@-"
+                    "--write-out" (format nil "~%%{http_code}")
+                    url))
+      (encode request)
+      streaming)))
+
+(defun parse-provider-output (output error-output status streaming)
+  "Decode the reply curl printed for a provider request, or signal a
+PROVIDER-ERROR. STATUS is curl's exit status."
+  (let* ((newline (position #\Newline output :from-end t))
+         (response-body (if newline (subseq output 0 newline) output))
+         (http-status (if newline (subseq output (1+ newline)) "000")))
+    (unless (and (zerop status)
+                 (= (length http-status) 3)
+                 (char= (char http-status 0) #\2))
+      (error 'provider-error
+             :message (response-error-message response-body
+                                              (if (zerop status) http-status status)
+                                              error-output)))
+    (handler-case (if streaming
+                      (decode-responses-sse response-body)
+                      (decode response-body))
+      (error (condition)
+        (when (typep condition 'provider-error) (error condition))
+        (error 'provider-error
+               :message (format nil "Provider returned invalid ~A: ~A~%~A"
+                                (if streaming "SSE" "JSON")
+                                condition response-body))))))
+
+(defun post-provider (client request)
+  (multiple-value-bind (arguments body streaming)
+      (provider-request-arguments client request)
     ;; The request body goes to the child's standard input. At the prompt the
     ;; child runs asynchronously so the user can still browse the transcript
     ;; and queue steering prompts while the model works.
     (multiple-value-bind (output error-output status)
         (run-command arguments :input body)
-      (let* ((newline (position #\Newline output :from-end t))
-             (response-body (if newline (subseq output 0 newline) output))
-             (http-status (if newline (subseq output (1+ newline)) "000")))
-        (unless (and (zerop status)
-                     (= (length http-status) 3)
-                     (char= (char http-status 0) #\2))
-          (error 'provider-error
-                 :message (response-error-message response-body
-                                                  (if (zerop status) http-status status)
-                                                  error-output)))
-        (handler-case (if streaming
-                          (decode-responses-sse response-body)
-                          (decode response-body))
-          (error (condition)
-            (when (typep condition 'provider-error) (error condition))
-            (error 'provider-error
-                   :message (format nil "Provider returned invalid ~A: ~A~%~A"
-                                    (if streaming "SSE" "JSON")
-                                    condition response-body))))))))
+      (parse-provider-output output error-output status streaming))))
 
-(defun call-provider (client messages tools)
+(defun require-model (client)
   (when (zerop (length (client-model client)))
     (error 'provider-error
-           :message "No model configured. Set MAXWELL_MODEL or pass --model."))
+           :message "No model configured. Set MAXWELL_MODEL or pass --model.")))
+
+(defun provider-request-object (client messages tools)
   (if (eq (client-wire-api client) :responses)
-      (responses-as-chat-response
-        (post-provider client (responses-request-object client messages tools)))
-      (post-provider client (chat-request-object client messages tools))))
+      (responses-request-object client messages tools)
+      (chat-request-object client messages tools)))
+
+;;; A provider request that runs in the background: the compactor starts
+;;; several, polls them between keystrokes, and collects each when it ends.
+
+(defstruct (provider-job (:constructor %make-provider-job))
+  "An in-flight provider request started by START-PROVIDER-REQUEST."
+  command
+  wire-api
+  streaming)
+
+(defun start-provider-request (client messages tools)
+  "Start a request for MESSAGES and TOOLS without waiting for the reply.
+Returns a PROVIDER-JOB to poll with PROVIDER-REQUEST-FINISHED-P."
+  (require-model client)
+  (multiple-value-bind (arguments body streaming)
+      (provider-request-arguments client (provider-request-object client messages tools))
+    (%make-provider-job :command (start-command arguments :input body)
+                        :wire-api (client-wire-api client)
+                        :streaming streaming)))
+
+(defun provider-request-finished-p (job)
+  "True once JOB's reply has fully arrived."
+  (command-finished-p (provider-job-command job)))
+
+(defun finish-provider-request (job)
+  "Collect JOB's reply in Chat Completions form, as CALL-PROVIDER returns it.
+Signals PROVIDER-ERROR when the request failed."
+  (let ((response (multiple-value-bind (output error-output status)
+                      (finish-command (provider-job-command job))
+                    (parse-provider-output output error-output status
+                                           (provider-job-streaming job)))))
+    (if (eq (provider-job-wire-api job) :responses)
+        (responses-as-chat-response response)
+        response)))
+
+(defun cancel-provider-request (job)
+  "Abandon JOB, stopping its curl process."
+  (cancel-command (provider-job-command job)))
+
+(defun call-provider (client messages tools)
+  (require-model client)
+  (let ((response (post-provider client (provider-request-object client messages tools))))
+    (if (eq (client-wire-api client) :responses)
+        (responses-as-chat-response response)
+        response)))
