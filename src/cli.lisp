@@ -16,6 +16,7 @@ Usage: maxwell [options] [prompt ...]
       --request-json JSON add provider-specific request fields
   -C, --workspace DIR     project directory
   -p, --print PROMPT      run once and exit
+      --color WHEN        auto (default), always, or never
   -h, --help              show this help
 
 Environment: OPENAI_API_KEY, MAXWELL_MODEL, MAXWELL_BASE_URL,
@@ -34,7 +35,8 @@ previous session, remembered in ~/.config/maxwell/session.json.
 (defun parse-options (arguments)
   (let ((model nil) (base-url nil) (endpoint nil) (wire-api nil) (api-key-env nil)
         (auth-provider nil) (login-provider nil)
-        (headers '()) (request-json nil) (workspace nil) (prompt nil) (help nil))
+        (headers '()) (request-json nil) (workspace nil) (prompt nil) (help nil)
+        (color nil))
     (loop while arguments
           for argument = (pop arguments)
           do (cond
@@ -64,13 +66,15 @@ previous session, remembered in ~/.config/maxwell/session.json.
                 (multiple-value-setq (workspace arguments) (take-option arguments argument)))
                ((member argument '("-p" "--print") :test #'string=)
                 (multiple-value-setq (prompt arguments) (take-option arguments argument)))
+               ((string= argument "--color")
+                (multiple-value-setq (color arguments) (take-option arguments argument)))
                ((and (plusp (length argument)) (char= (char argument 0) #\-))
                 (error "Unknown option ~A." argument))
                (t
                 (setf prompt (format nil "~{~A~^ ~}" (cons argument arguments))
                       arguments nil))))
     (values model base-url endpoint wire-api api-key-env auth-provider login-provider
-            (nreverse headers) request-json workspace prompt help)))
+            (nreverse headers) request-json workspace prompt help color)))
 
 (defun command-p (line name)
   (string= (string-trim '(#\Space #\Tab) line) name))
@@ -132,11 +136,13 @@ remember it as the provider of this session."
 (defun print-model-catalog (agent)
   (let* ((client (agent-client agent))
          (models (list-provider-models client)))
-    (format t "~&Current model: ~A~%Available from ~A:~%"
-            (client-model client) (client-base-url client))
+    (format t "~&Current model: ~A~%~A~%"
+            (client-model client)
+            (styled :dim (format nil "Available from ~A:" (client-base-url client))))
     (dolist (model models)
-      (format t "  ~A~@[ — ~A~]~%" (car model)
-              (unless (string= (car model) (cdr model)) (cdr model))))
+      (format t "  ~A~@[ ~A~]~%" (car model)
+              (unless (string= (car model) (cdr model))
+                (styled :dim (format nil "— ~A" (cdr model))))))
     models))
 
 (defun select-model (agent model-id)
@@ -147,7 +153,7 @@ remember it as the provider of this session."
       (error "Model ~S is not available from the current provider." model-id))
     (setf (client-model (agent-client agent)) model-id)
     (remember-client (agent-client agent))
-    (format t "Selected model: ~A~%" model-id)))
+    (format t "~A~%" (styled :dim (format nil "Selected model: ~A" model-id)))))
 
 (defun run-interactive-turn (line agent)
   "Run LINE, keeping the prompt live while the model works so that the user can
@@ -170,16 +176,18 @@ browse the transcript and queue steering prompts."
 
 (defun interactive-loop (&optional (agent *agent*))
   (setf *agent* (or agent (make-agent)))
-  (format t "~&Maxwell ~A — ~A~%Type /help for commands; PgUp/PgDn browse the transcript, Up/Down recall previous prompts.~%"
-          (client-model (agent-client *agent*))
-          (namestring (agent-workspace *agent*)))
+  (record-entry :status
+                (format nil "Maxwell ~A — ~A~%Type /help for commands; PgUp/PgDn browse the transcript, Ctrl-T expands tool calls, Up/Down recall previous prompts."
+                        (client-model (agent-client *agent*))
+                        (namestring (agent-workspace *agent*)))
+                :show t)
   (loop
     (let ((line (read-interactive-prompt *agent*)))
       (unless line (return 0))
       (cond
         ((or (command-p line "/quit") (command-p line "/exit")) (return 0))
         ((command-p line "/help")
-         (format t "/login openai  sign in with ChatGPT OAuth~%/model         list current provider's available models~%/model MODEL   select an available model~%/save PATH      save a resumable executable image and exit~%/history        show message count~%/quit           exit~%Editing: Up/Down history; Ctrl-A/E line ends; Ctrl-U/W/K kill; Ctrl-Y yank.~%While the model works: PgUp/PgDn browse the transcript; type a line and~%press Enter to steer the model before its next request.~%"))
+         (write-line (style-lines :dim (format nil "/login openai  sign in with ChatGPT OAuth~%/model         list current provider's available models~%/model MODEL   select an available model~%/save PATH      save a resumable executable image and exit~%/history        show message count~%/quit           exit~%Editing: Up/Down history; Ctrl-A/E line ends; Ctrl-U/W/K kill; Ctrl-Y yank.~%Ctrl-T expands or collapses tool calls; PgUp/PgDn browse the transcript.~%While the model works: type a line and press Enter to steer the model~%before its next request."))))
         ((command-p line "/login openai")
          (handler-case
              (progn
@@ -191,12 +199,12 @@ browse the transcript and queue steering prompts."
         ((command-p line "/model")
          (handler-case (print-model-catalog *agent*)
            (error (condition)
-             (format *error-output* "Could not list models: ~A~%" condition))))
+             (report-error "Could not list models: ~A" condition))))
         ((command-argument line "/model ")
          (handler-case
              (select-model *agent* (command-argument line "/model "))
            (error (condition)
-             (format *error-output* "Could not select model: ~A~%" condition))))
+             (report-error "Could not select model: ~A" condition))))
         ((command-p line "/history")
          (format t "~D messages~%" (length (agent-history *agent*))))
         ((command-argument line "/save ")
@@ -207,19 +215,35 @@ browse the transcript and queue steering prompts."
         ((zerop (length (string-trim '(#\Space #\Tab) line))))
         (t
          (handler-case (run-interactive-turn line *agent*)
-           (error (condition) (format *error-output* "Error: ~A~%" condition))))))))
+           (error (condition)
+             (record-entry :status (format nil "Error: ~A" condition) :ok-p nil :show t))))))))
+
+(defun report-error (control &rest arguments)
+  "Print an error message on *ERROR-OUTPUT* in the :error face."
+  (format *error-output* "~&~A~%" (styled :error (apply #'format nil control arguments))))
+
+(defun color-option (arguments)
+  "The value of --color in ARGUMENTS, or :auto."
+  (or (second (member "--color" arguments :test #'string=)) :auto))
 
 (defun image-main ()
+  ;; Colour and the transcript belong to this terminal session, not the saved one.
+  (reset-transcript)
+  (handler-case (configure-color (color-option (uiop:command-line-arguments)))
+    (error () (configure-color :auto)))
   (handler-case (interactive-loop *agent*)
     (error (condition)
-      (format *error-output* "Fatal error: ~A~%" condition)
+      (report-error "Fatal error: ~A" condition)
       1)))
 
 (defun main (&optional (arguments (uiop:command-line-arguments)))
+  (reset-transcript)
+  (configure-color :auto)
   (handler-case
       (multiple-value-bind (model base-url endpoint wire-api api-key-env auth-provider
-                            login-provider headers request-json workspace prompt help)
+                            login-provider headers request-json workspace prompt help color)
           (parse-options arguments)
+        (when color (configure-color color))
         (when help (usage) (return-from main 0))
         (when login-provider
           (unless (string-equal login-provider "openai")
@@ -254,5 +278,5 @@ browse the transcript and queue steering prompts."
               (progn (run prompt :agent agent) 0)
               (interactive-loop agent)))))
     (error (condition)
-      (format *error-output* "maxwell: ~A~%" condition)
+      (report-error "maxwell: ~A" condition)
       1)))

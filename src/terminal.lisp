@@ -37,72 +37,13 @@ remembered prompts, most recent first."
           do (decf index))
     index))
 
-(defun transpose-characters (text cursor)
-  "Swap the characters around CURSOR (Ctrl-T). Returns (VALUES TEXT CURSOR)."
-  (let* ((at-end (>= cursor (length text)))
-         (left (if at-end (- cursor 2) (1- cursor)))
-         (right (if at-end (1- cursor) cursor)))
-    (if (or (minusp left) (>= right (length text)) (>= left right))
-        (values text cursor)
-        (values (concatenate 'string
-                             (subseq text 0 left)
-                             (string (char text right))
-                             (subseq text (1+ left) right)
-                             (string (char text left))
-                             (subseq text (1+ right)))
-                (1+ right)))))
-
-(defun terminal-command (&rest arguments)
-  ;; Use the controlling terminal, not redirected standard input.
-  ;; UIOP starts the child in a separate process group. A background stty
-  ;; receives SIGTTOU when changing terminal settings, even with echo off.
-  ;; Ignore that signal in the child so setup and restoration can complete.
-  (uiop:run-program (append '("sh" "-c"
-                             "trap '' TTOU; exec stty -F /dev/tty \"$@\""
-                             "maxwell-stty") arguments)
-                    :output :string :error-output :string))
-
-(defun transcript-text (agent)
-  (with-output-to-string (out)
-    (dolist (message (agent-history agent))
-      (format out "~A:~%~A~%" (get-key message "role" "message")
-              (message-content message))
-      (let ((calls (get-key message "tool_calls")))
-        (when (vectorp calls)
-          (loop for call across calls
-                for function = (get-key call "function")
-                do (format out "[~A] ~A~%" (get-key function "name")
-                           (get-key function "arguments")))))
-      (terpri out))))
-
-(defun transcript-lines (text width)
-  "Wrap text for display, stripping terminal control characters."
-  (let ((lines '()) (line (make-string-output-stream)) (column 0))
-    (labels ((flush-line ()
-               (push (get-output-stream-string line) lines)
-               (setf column 0))
-             (emit (character)
-               (when (= column width) (flush-line))
-               (write-char character line)
-               (incf column)))
-      (loop for character across text
-            do (cond ((char= character #\Newline) (flush-line))
-                     ((char= character #\Tab)
-                      (dotimes (i (- 8 (mod column 8))) (emit #\Space)))
-                     ((and (>= (char-code character) 32)
-                           (/= (char-code character) 127)
-                           (not (<= 128 (char-code character) 159)))
-                      (emit character))))
-      (when (or (plusp column) (null lines)) (flush-line)))
-    (coerce (nreverse lines) 'vector)))
-
-(defun transcript-page-start (start direction count page-size)
-  (max 0 (min (max 0 (- count page-size))
-              (+ start (* direction page-size)))))
-
 (defun terminal-key (stream)
+  "Read one key from STREAM: a character, NIL at end of file, or a keyword for
+an escape sequence. Ctrl-T is :TOGGLE-TOOLS everywhere."
   (let ((character (read-char stream nil nil)))
-    (if (and character (char= character #\Escape))
+    (cond
+      ((eql character (code-char 20)) :toggle-tools)
+      ((and character (char= character #\Escape))
         (let ((sequence (make-string-output-stream)))
           (loop for index below 12
                 do (loop repeat 5 until (listen stream) do (sleep 0.01))
@@ -122,48 +63,63 @@ remembered prompts, most recent first."
                   ((member code '("[H" "[1~" "OH") :test #'string=) :home)
                   ((member code '("[F" "[4~" "OF") :test #'string=) :end)
                   ((string= code "[3~") :delete)
-                  (t :escape))))
-        character)))
+                  (t :escape)))))
+      (t character))))
 
-(defun browse-transcript (agent input output)
-  "Display a paged snapshot on the alternate screen; return the exit key."
-  (let* ((size (ignore-errors
-                 (mapcar #'parse-integer
-                         (remove "" (uiop:split-string (terminal-command "size"))
-                                 :test #'string=))))
-         (rows (max 3 (or (first size) 24)))
-         (width (max 1 (1- (or (second size) 80))))
-         (page-size (- rows 2))
-         (lines (transcript-lines (transcript-text agent) width))
-         (start (max 0 (- (length lines) (* 2 page-size)))))
-    (unwind-protect
-         (progn
-           (format output "~C[?1049h" #\Escape)
-           (loop
-             (format output "~C[H~C[2J" #\Escape #\Escape)
-             (loop for i from start below (min (length lines) (+ start page-size))
-                   do (format output "~A~%" (aref lines i)))
-             (format output "~C[~D;1HTranscript ~D-~D/~D | PgUp/PgDn scroll; Esc returns"
-                     #\Escape rows (1+ start)
-                     (min (length lines) (+ start page-size)) (length lines))
-             (finish-output output)
-             (let ((key (terminal-key input)))
-               (case key
-                 (:page-up (setf start (transcript-page-start start -1 (length lines) page-size)))
-                 (:page-down
-                  (if (= start (max 0 (- (length lines) page-size)))
-                      (return :escape)
-                      (setf start (transcript-page-start start 1 (length lines) page-size))))
-                 (otherwise (return key))))))
-      (format output "~C[?1049l" #\Escape)
-      (finish-output output))))
+(defun draw-viewer (viewer rows output)
+  (format output "~C[H~C[2J" #\Escape #\Escape)
+  (let* ((start (viewer-start viewer))
+         (count (viewer-row-count viewer))
+         (end (min count (+ start (viewer-page-size viewer)))))
+    (loop for k from start below end
+          do (write-line (viewer-row viewer k) output))
+    (format output "~C[~D;1H~A" #\Escape rows
+            (styled :dim
+                    (format nil "Transcript ~D-~D/~D~:[~;+~] | PgUp/PgDn scroll; Ctrl-T ~
+                                 ~:[expand~;collapse~] tools; Esc returns"
+                            (min count (1+ start)) end count
+                            (viewer-more-above-p viewer)
+                            (eq *tool-display* :full)))))
+  (finish-output output))
+
+(defun browse-transcript (input output &optional (entries *session-entries*))
+  "Page through ENTRIES on the alternate screen, rendering older entries only
+as the user scrolls back to them; return the exit key. Ctrl-T switches the
+tool display and keeps the entry at the top of the screen where it is; the
+main screen is redrawn in the new mode on the way out."
+  (multiple-value-bind (rows columns) (terminal-size)
+    (let ((viewer (open-viewer entries (1- columns) (- rows 2)))
+          (mode *tool-display*))
+      (unwind-protect
+           (progn
+             (format output "~C[?1049h" #\Escape)
+             (loop
+               (draw-viewer viewer rows output)
+               (let ((key (terminal-key input)))
+                 (case key
+                   (:page-up (viewer-scroll viewer -1))
+                   (:page-down
+                    (if (viewer-at-bottom-p viewer)
+                        (return :escape)
+                        (viewer-scroll viewer 1)))
+                   (:toggle-tools
+                    (toggle-tool-display)
+                    (clear-row-cache)
+                    (viewer-rerender viewer))
+                   (otherwise (return key))))
+               ;; A resized terminal invalidates every rendered row.
+               (multiple-value-bind (new-rows new-columns) (terminal-size)
+                 (unless (and (= new-rows rows) (= new-columns columns))
+                   (setf rows new-rows columns new-columns)
+                   (clear-row-cache)
+                   (viewer-rerender viewer :width (1- columns) :page-size (- rows 2))))))
+        (format output "~C[?1049l" #\Escape)
+        (finish-output output)
+        (unless (eq mode *tool-display*)
+          (redraw-transcript output))))))
 
 (defun terminal-columns ()
-  (or (ignore-errors
-        (second (mapcar #'parse-integer
-                        (remove "" (uiop:split-string (terminal-command "size")
-                                                      :test #'string=)))))
-      80))
+  (nth-value 1 (terminal-size)))
 
 (defun interactive-terminal-state ()
   "The controlling terminal's saved settings, or NIL when Maxwell is not on an
@@ -238,12 +194,14 @@ the next prompt instead of being discarded.")
           (prompt-editor-cursor editor) (+ cursor (length string)))))
 
 (defun editor-key (editor key)
-  "Handle one KEY in EDITOR. Returns :SUBMIT, :CANCEL, :BROWSE, or :CONTINUE."
+  "Handle one KEY in EDITOR. Returns :SUBMIT, :CANCEL, :BROWSE, :TOGGLE, or
+:CONTINUE."
   (let ((text (prompt-editor-text editor))
         (cursor (prompt-editor-cursor editor)))
     (cond
       ((null key) :cancel)
       ((eq key :page-up) :browse)
+      ((eq key :toggle-tools) :toggle)
       ((and (characterp key) (find key '(#\Newline #\Return))) :submit)
       ;; Ctrl-D deletes forward, or ends the session on an empty line.
       ((and (characterp key) (= (char-code key) 4))
@@ -284,11 +242,6 @@ the next prompt instead of being discarded.")
        (editor-kill editor (word-start-before text cursor) cursor) :continue)
       ;; Editing.
       ((eql key (code-char 25)) (editor-insert editor *prompt-kill*) :continue)
-      ((eql key (code-char 20))
-       (multiple-value-bind (new-text new-cursor) (transpose-characters text cursor)
-         (setf (prompt-editor-text editor) new-text
-               (prompt-editor-cursor editor) new-cursor))
-       :continue)
       ((eql key (code-char 12))
        (format (prompt-editor-output editor) "~C[H~C[2J" #\Escape #\Escape)
        :continue)
@@ -296,19 +249,30 @@ the next prompt instead of being discarded.")
        (editor-insert editor (string key)) :continue)
       (t :continue))))
 
+(defun echo-submitted-prompt (editor)
+  "Replace the prompt line with the submitted text, drawn as a user entry."
+  (let ((output (prompt-editor-output editor))
+        (text (prompt-editor-text editor)))
+    (if (zerop (length (string-trim '(#\Space #\Tab) text)))
+        (progn (terpri output) (finish-output output))
+        (progn (editor-erase editor)
+               (print-entry (make-entry :user text) output)))))
+
 (defun read-terminal-prompt (agent input output)
   "Read one prompt line with readline-style editing: Up/Down recall previous
-prompts, PgUp opens the transcript, and Ctrl-A/E/B/F/U/W/K/Y/T/L edit the line."
+prompts, PgUp opens the transcript, Ctrl-T expands or collapses tool calls,
+and Ctrl-A/E/B/F/U/W/K/Y/L edit the line."
+  (declare (ignorable agent))
   (let ((editor (make-prompt-editor agent input output :text *prompt-draft*)))
     (setf *prompt-draft* "")
     (editor-redraw editor)
     (loop for key = (terminal-key input)
           for action = (editor-key editor key)
           do (case action
-               (:browse (browse-transcript agent input output))
+               (:browse (browse-transcript input output))
+               (:toggle (toggle-tool-display) (redraw-transcript output))
                (:submit
-                (terpri output)
-                (finish-output output)
+                (echo-submitted-prompt editor)
                 (remember-prompt (prompt-editor-text editor))
                 (return (prompt-editor-text editor)))
                (:cancel (return nil)))
@@ -350,13 +314,14 @@ prompts, PgUp opens the transcript, and Ctrl-A/E/B/F/U/W/K/Y/T/L edit the line."
     (editor-erase editor)
     (setf (steering-session-shown session) nil)
     (when (plusp (length (string-trim '(#\Space #\Tab) text)))
-      (format output "~&steer> ~A~%" text)
-      (finish-output output)
       (remember-prompt text)
-      (queue-steering text))))
+      (queue-steering text)
+      (show-entry *session-entries* (1- (length *session-entries*)) output))))
 
 (defun service-steering-input (session)
-  "Handle keystrokes waiting while the model works. Returns T when any arrived."
+  "Handle keystrokes waiting while the model works. Returns T when any arrived.
+PgUp/PgDn browse the transcript and Ctrl-T redraws it with tool calls expanded
+or collapsed; the steering line is drawn again afterwards."
   (let* ((editor (steering-session-editor session))
          (input (prompt-editor-input editor))
          (handled nil))
@@ -364,12 +329,12 @@ prompts, PgUp opens the transcript, and Ctrl-A/E/B/F/U/W/K/Y/T/L edit the line."
           do (setf handled t)
              (let ((key (terminal-key input)))
                (if (member key '(:page-up :page-down))
-                   (browse-transcript (prompt-editor-agent editor) input
-                                       (prompt-editor-output editor))
+                   (browse-transcript input (prompt-editor-output editor))
                    (case (editor-key editor key)
                      (:submit (steering-submit session))
-                     (:browse (browse-transcript (prompt-editor-agent editor) input
-                                                 (prompt-editor-output editor)))
+                     (:browse (browse-transcript input (prompt-editor-output editor)))
+                     (:toggle (toggle-tool-display)
+                      (redraw-transcript (prompt-editor-output editor)))
                      (otherwise nil)))))
     (if handled
         (progn (editor-redraw editor)

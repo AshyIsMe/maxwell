@@ -218,7 +218,163 @@ fn main() {}") :rust))
       (check (string= (maxwell::render-markdown "## A `b` c")
                       (esc "~[1;35mA ~[36mb~[0m~[1;35m c~[0m"))))))
 
+(defun entry-vector (&rest entries)
+  (let ((vector (maxwell::make-entry-vector)))
+    (dolist (entry entries vector) (vector-push-extend entry vector))))
+
+(defun rows-text (rows)
+  (format nil "~{~A~^~%~}" (coerce rows 'list)))
+
+(defun test-tool-blocks ()
+  (let* ((code (format nil "(defun parse-header (line)~%  (subseq line 0 4))~%(parse-header \"abcdef\")"))
+         (result (format nil "~{line ~D~^~%~}~%=> \"abcd\"" (loop for i from 1 to 5 collect i)))
+         (entries (entry-vector (maxwell::make-entry :tool code)
+                                (maxwell::make-entry :echo result))))
+    (let ((maxwell::*color* nil))
+      ;; Summary: the first form on one line, the last result lines, a count.
+      (check (equal (coerce (maxwell::entry-rows entries 0 60 :summary) 'list)
+                    '("• lisp (defun parse-header (line) (subseq line 0 4)) …"
+                      "  └ line 4"
+                      "    line 5"
+                      "    => \"abcd\""
+                      "    … +5 lines (ctrl-t to expand)"
+                      "")))
+      ;; The result is drawn with its call, not again on its own.
+      (check (zerop (length (maxwell::entry-rows entries 1 60 :summary))))
+      ;; A long first form is cut to the width.
+      (let ((rows (maxwell::entry-rows
+                    (entry-vector (maxwell::make-entry
+                                    :tool (format nil "(list ~{~D ~})" (loop for i below 50 collect i)))
+                                  (maxwell::make-entry :echo "ok"))
+                    0 30 :summary)))
+        (check (= 30 (length (aref rows 0))))
+        (check (char= #\… (char (aref rows 0) 29))))
+      ;; Full: all code, then the whole result.
+      (check (equal (coerce (maxwell::entry-rows entries 0 60 :full) 'list)
+                    '("• lisp"
+                      "    (defun parse-header (line)"
+                      "      (subseq line 0 4))"
+                      "    (parse-header \"abcdef\")"
+                      "  └ line 1"
+                      "    line 2" "    line 3" "    line 4" "    line 5"
+                      "    => \"abcd\"" ""))))
+    (let ((maxwell::*color* t))
+      ;; Green bullet on success, red on error, in both modes.
+      (check (search (esc "~[32m•~[0m") (aref (maxwell::entry-rows entries 0 60 :summary) 0)))
+      (let ((failed (entry-vector (maxwell::make-entry :tool "(error \"x\")")
+                                  (maxwell::make-entry :echo "SIMPLE-ERROR: x" :ok-p nil))))
+        (dolist (mode '(:summary :full))
+          (check (search (esc "~[31m•~[0m") (aref (maxwell::entry-rows failed 0 60 mode) 0))))
+        (check (search (esc "~[31mSIMPLE-ERROR: x~[0m")
+                       (rows-text (maxwell::entry-rows failed 0 60 :full)))))
+      ;; Full mode highlights the code as Lisp; summaries dim the result.
+      (check (search (esc "~[35mdefun~[0m") (rows-text (maxwell::entry-rows entries 0 60 :full))))
+      (check (search (esc "~[2mline 5~[0m") (rows-text (maxwell::entry-rows entries 0 60 :summary))))
+      ;; Other entries: the user gutter, steering echoes, error status, markdown.
+      (let ((others (entry-vector (maxwell::make-entry :user "hi")
+                                  (maxwell::make-entry :steer "be brief")
+                                  (maxwell::make-entry :status "bad" :ok-p nil)
+                                  (maxwell::make-entry :assistant "**ok**"))))
+        (check (string= (aref (maxwell::entry-rows others 0 40) 0) (esc "~[36m›~[0m ~[1mhi~[0m")))
+        (check (string= (aref (maxwell::entry-rows others 1 40) 0)
+                        (esc "~[33msteer>~[0m ~[33mbe brief~[0m")))
+        (check (string= (aref (maxwell::entry-rows others 2 40) 0) (esc "~[31mbad~[0m")))
+        (check (string= (aref (maxwell::entry-rows others 3 40) 0) (esc "~[1mok~[0m")))))
+    ;; Without a terminal width nothing wraps and no separator rows are added.
+    (let ((maxwell::*color* nil)
+          (long (make-string 200 :initial-element #\a)))
+      (check (equalp (maxwell::entry-rows (entry-vector (maxwell::make-entry :assistant long)) 0 nil)
+                     (vector long))))
+    ;; Live printing waits for the result, then prints the pair once.
+    (let ((maxwell::*color* nil)
+          (maxwell::*session-entries* (maxwell::make-entry-vector))
+          (out (make-string-output-stream)))
+      (maxwell::record-entry :tool "(+ 1 2)" :show t :stream out)
+      (check (string= "" (get-output-stream-string out)))
+      (maxwell::record-entry :echo "3" :show t :stream out)
+      (check (string= (get-output-stream-string out) (format nil "• lisp (+ 1 2)~%  └ 3~%"))))))
+
+(defun numbered-entries (count)
+  "COUNT one-line replies, each two rows tall at a terminal width."
+  (let ((vector (maxwell::make-entry-vector)))
+    (dotimes (i count vector)
+      (vector-push-extend (maxwell::make-entry :assistant (format nil "reply ~D" i)) vector))))
+
+(defun test-lazy-viewer ()
+  (let ((maxwell::*color* nil)
+        (maxwell::*older-entries-function* nil)
+        (entries (numbered-entries 1000)))
+    (maxwell::clear-row-cache)
+    ;; A redraw renders only about two pages, however long the session.
+    (let ((maxwell::*entry-render-count* 0))
+      (multiple-value-bind (rows more) (maxwell::transcript-tail entries 79 24)
+        (check (= 48 (length rows)))
+        (check more)
+        (check (string= "reply 999" (first (last rows 2))))
+        (check (<= maxwell::*entry-render-count* 30))))
+    ;; The viewer opens on the same rows, rendering little more.
+    (let* ((maxwell::*entry-render-count* 0)
+           (viewer (maxwell::open-viewer entries 79 22)))
+      (check (<= maxwell::*entry-render-count* 40))
+      ;; Scrolling up renders older batches; the entry a page above comes to
+      ;; the top and stays there while batches are added above it.
+      (loop repeat 10
+            do (let ((count maxwell::*entry-render-count*)
+                     (target (nth-value 1 (maxwell::viewer-row
+                                            viewer (- (maxwell::viewer-start viewer) 22)))))
+                 (maxwell::viewer-scroll viewer -1)
+                 (check (eq target (maxwell::viewer-top-entry viewer)))
+                 (check (> maxwell::*entry-render-count* count))))
+      (check (<= maxwell::*entry-render-count* 160))
+      ;; Ctrl-T re-renders around the top entry and keeps it at the top.
+      (let ((top (maxwell::viewer-top-entry viewer))
+            (maxwell::*entry-render-count* 0))
+        (maxwell::clear-row-cache)
+        (let ((maxwell::*tool-display* :full))
+          (maxwell::viewer-rerender viewer))
+        (check (eq top (maxwell::viewer-top-entry viewer)))
+        (check (<= maxwell::*entry-render-count* 60)))
+      ;; Paging back to the start reaches the first entry.
+      (loop repeat 200 do (maxwell::viewer-scroll viewer -1))
+      (check (eq (aref entries 0) (maxwell::viewer-top-entry viewer)))
+      (check (not (maxwell::viewer-more-above-p viewer)))))
+  ;; Older entries come from *OLDER-ENTRIES-FUNCTION* once the session's run
+  ;; out, and a tool call split from its result by a batch is drawn whole.
+  (let* ((maxwell::*color* nil)
+         (log (entry-vector (maxwell::make-entry :user "old question")
+                            (maxwell::make-entry :tool "(old)")))
+         (session (entry-vector (maxwell::make-entry :echo "OLD-RESULT")
+                                (maxwell::make-entry :assistant "new reply")))
+         (calls '())
+         (maxwell::*older-entries-function*
+           (lambda (oldest count)
+             (push (list oldest count) calls)
+             (if (eq oldest (aref session 0)) log #()))))
+    (maxwell::clear-row-cache)
+    (let* ((viewer (maxwell::open-viewer session 79 22))
+           (text (format nil "~{~A~^~%~}"
+                         (loop for k below (maxwell::viewer-row-count viewer)
+                               collect (maxwell::viewer-row viewer k)))))
+      (check calls)
+      (check (search (format nil "› old question~%~%• lisp (old)~%  └ OLD-RESULT") text))
+      (check (not (maxwell::viewer-more-above-p viewer))))))
+
+(defun test-recent-exchanges ()
+  (let ((maxwell::*color* t)
+        (out (make-string-output-stream))
+        (entries (entry-vector (maxwell::make-entry :user "one") (maxwell::make-entry :assistant "a")
+                               (maxwell::make-entry :user "two") (maxwell::make-entry :assistant "b")
+                               (maxwell::make-entry :user "three") (maxwell::make-entry :assistant "c"))))
+    (maxwell::show-recent-exchanges entries :count 2 :stream out)
+    (let ((text (get-output-stream-string out)))
+      (check (not (search "one" text)))
+      (check (search (esc "~[2m› two~[0m") text))
+      (check (search (esc "~[2mc~[0m") text)))))
+
 (defun run-ui-tests ()
+  (test-tool-blocks)
+  (test-lazy-viewer)
+  (test-recent-exchanges)
   (test-style)
   (test-lisp-lexer)
   (test-c-family-lexers)

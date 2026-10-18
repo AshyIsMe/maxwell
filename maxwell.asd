@@ -17,6 +17,7 @@
                (:file "src/session")
                (:file "src/memory")
                (:file "src/compactor")
+               (:file "src/render")
                (:file "src/agent")
                (:file "src/terminal")
                (:file "src/cli"))

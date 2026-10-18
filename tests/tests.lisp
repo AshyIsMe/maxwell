@@ -20,7 +20,15 @@
   (check (string= "3" (maxwell:eval-lisp "(+ 1 2)")))
   (check (search "hello" (maxwell:eval-lisp "(format t \"hello\") 9")))
   (maxwell:eval-lisp "(defparameter *remembered* 41)")
-  (check (string= "42" (maxwell:eval-lisp "(1+ *remembered*)"))))
+  (check (string= "42" (maxwell:eval-lisp "(1+ *remembered*)")))
+  ;; The second value tells errors apart without parsing the text.
+  (check (null (nth-value 1 (maxwell:eval-lisp "(+ 1 2)"))))
+  (multiple-value-bind (text error-p) (maxwell:eval-lisp "(error \"boom\")")
+    (check error-p)
+    (check (search "SIMPLE-ERROR: boom" text)))
+  ;; Output the model reads is never styled.
+  (let ((maxwell::*color* t))
+    (check (string= "\"(car x)\"" (maxwell:eval-lisp "(maxwell::highlight-code \"(car x)\" :lisp)")))))
 
 (defun test-agent-loop ()
   (let ((responses
@@ -35,9 +43,13 @@
                       (maxwell:run "Calculate it." :agent agent :print-response nil)))
       (check (= 4 (length (maxwell:agent-history agent)))))))
 
+(defun entries-text (entries)
+  (format nil "~{~A~^~%~}" (map 'list #'maxwell::entry-text entries)))
+
 (defun test-nested-agent-run ()
   (let* ((outer (maxwell:make-agent))
          (maxwell:*agent* outer)
+         (maxwell::*session-entries* (maxwell::make-entry-vector))
          (responses
            (list (fake-response
                    :tool-calls (maxwell/json:json-array
@@ -51,8 +63,11 @@
     (check (string= "Tests finished."
                     (maxwell:run "Run tests." :agent outer :print-response nil)))
     (check (eq outer maxwell:*agent*))
-    (check (not (search "Calculate it." (maxwell::transcript-text outer))))
-    (check (search "Run tests." (maxwell::transcript-text outer)))
+    ;; The nested run's entries stay out of the session's transcript.
+    (check (not (search "Calculate it." (entries-text maxwell::*session-entries*))))
+    (check (search "Run tests." (entries-text maxwell::*session-entries*)))
+    (check (equal '(:user :tool :echo :assistant)
+                  (map 'list #'maxwell::entry-kind maxwell::*session-entries*)))
     (check (string= "Still here."
                     (maxwell:run "Continue." :print-response nil)))
     (check (= 6 (length (maxwell:agent-history outer)))))
@@ -199,13 +214,8 @@
     (check (equal '(("compatible" . "compatible")) models))))
 
 (defun test-terminal ()
-  (check (= 0 (maxwell::transcript-page-start 0 -1 100 20)))
-  (check (= 80 (maxwell::transcript-page-start 70 1 100 20)))
-  (check (= 0 (maxwell::transcript-page-start 0 1 3 20)))
-  (check (equalp #("abcd" "ef" "x")
-                 (maxwell::transcript-lines (format nil "abcdef~%x") 4)))
-  (check (equalp #("ab")
-                 (maxwell::transcript-lines (format nil "a~Cb" #\Escape) 80)))
+  (check (eq :toggle-tools (maxwell::terminal-key
+                              (make-string-input-stream (string (code-char 20))))))
   (dolist (pair '(("[5~" . :page-up) ("[6~" . :page-down)
                   ("[A" . :up) ("[B" . :down) ("OA" . :up) ("OB" . :down)
                   ("[D" . :left) ("[C" . :right) ("OH" . :home) ("[3~" . :delete)))
@@ -213,10 +223,9 @@
                (maxwell::terminal-key
                  (make-string-input-stream (format nil "~C~A" #\Escape (car pair)))))))
   (let* ((agent (maxwell:make-agent))
-         (output (make-string-output-stream)))
-    (setf (maxwell:agent-history agent)
-          (list (maxwell/json:json-object "role" "user" "content" "hello")))
-    (check (search "hello" (maxwell::transcript-text agent)))
+         (output (make-string-output-stream))
+         (maxwell::*session-entries* (maxwell::make-entry-vector)))
+    (maxwell::record-entry :user "hello")
     ;; Browse, return with Escape, then submit the original draft unchanged.
     (check (string= "draft"
                     (maxwell::read-terminal-prompt
@@ -225,8 +234,10 @@
                         (format nil "draft~C[5~~~C[6~~~C[6~~~%"
                                 #\Escape #\Escape #\Escape))
                       output)))
-    (check (search (format nil "~C[?1049h" #\Escape)
-                   (get-output-stream-string output))))
+    (let ((text (get-output-stream-string output)))
+      (check (search (format nil "~C[?1049h" #\Escape) text))
+      ;; The viewer draws the session's entries.
+      (check (search "› hello" text))))
   (let ((maxwell::*agent* nil)
         (*standard-input* (make-string-input-stream (format nil "plain~%")))
         (*standard-output* (make-string-output-stream)))
@@ -257,8 +268,12 @@
       (check (string= "!hello"
                       (feed (keys #\h #\e #\l #\l #\o (code-char 21) #\! (code-char 25)
                                   #\Newline))))
-      ;; Ctrl-T transposes the characters around the cursor.
-      (check (string= "ba" (feed (keys #\a #\b (code-char 20) #\Newline))))
+      ;; Ctrl-T toggles tool display and redraws instead of editing the line.
+      (let ((maxwell::*tool-display* :summary)
+            (maxwell::*session-entries* (maxwell::make-entry-vector)))
+        (check (string= "ab" (feed (keys #\a #\b (code-char 20) #\Newline))))
+        (check (eq maxwell::*tool-display* :full))
+        (check (search (format nil "~C[3J" #\Escape) (get-output-stream-string output))))
       ;; Ctrl-A and Ctrl-E jump to the ends of the line.
       (check (string= "abc" (feed (keys #\b #\c (code-char 1) #\a #\Newline))))
       (check (string= "abc" (feed (keys #\a #\b (code-char 1) (code-char 5) #\c #\Newline))))
@@ -494,6 +509,11 @@
 (defun run-tests ()
   ;; Tests may be run by the live agent through COMMON_LISP.
   (let ((maxwell:*agent* nil)
+        ;; Nor touch the live session's transcript or display settings.
+        (maxwell::*session-entries* (maxwell::make-entry-vector))
+        (maxwell::*tool-display* :summary)
+        (maxwell::*older-entries-function* nil)
+        (maxwell::*color* nil)
         (maxwell::*pending-image* nil)
         (maxwell::*prompt-history* '())
         (maxwell::*prompt-kill* "")

@@ -55,27 +55,32 @@
                "content" result))
 
 (defun execute-tool-call (agent call)
+  "Run CALL and return its tool message, recording the code and its result as
+transcript entries."
   (let* ((function (get-key call "function"))
          (name (get-key function "name"))
          (argument-value (get-key function "arguments" "{}")))
-    (cond
-      ((not (string= name "common_lisp"))
-       (tool-result-message call (format nil "Unknown tool ~S." name)))
-      (t
-       (handler-case
-           (let* ((arguments (if (stringp argument-value)
-                                 (decode argument-value)
-                                 argument-value))
-                  (code (get-key arguments "code")))
-             (unless (stringp code)
-               (error "COMMON_LISP requires a string CODE argument."))
-             (format t "~&[common-lisp]~%~A~%" code)
-             (let ((result (eval-lisp code :directory (agent-workspace agent))))
-               (format t "~A~%" result)
-               (tool-result-message call result)))
-         (error (condition)
-           (tool-result-message call
-                                (format nil "Tool argument error: ~A" condition))))))))
+    (flet ((failure (text)
+             (record-entry :echo text :ok-p nil)
+             (tool-result-message call text)))
+      (cond
+        ((not (string= name "common_lisp"))
+         (failure (format nil "Unknown tool ~S." name)))
+        (t
+         (handler-case
+             (let* ((arguments (if (stringp argument-value)
+                                   (decode argument-value)
+                                   argument-value))
+                    (code (get-key arguments "code")))
+               (unless (stringp code)
+                 (error "COMMON_LISP requires a string CODE argument."))
+               (record-entry :tool code)
+               (multiple-value-bind (result error-p)
+                   (eval-lisp code :directory (agent-workspace agent))
+                 (record-entry :echo result :ok-p (not error-p))
+                 (tool-result-message call result)))
+           (error (condition)
+             (failure (format nil "Tool argument error: ~A" condition)))))))))
 
 (defun message-content (message)
   (let ((content (get-key message "content")))
@@ -94,7 +99,9 @@ before its next request, so the user can redirect work already in progress.")
 (defun queue-steering (text)
   "Record TEXT as a steering prompt for the model's next request."
   (when (plusp (length (string-trim '(#\Space #\Tab) text)))
-    (setf *steering* (append *steering* (list text))))
+    (setf *steering* (append *steering* (list text)))
+    ;; The steering line already echoed it.
+    (record-entry :steer text :show nil))
   text)
 
 (defun steering-pending-p ()
@@ -115,29 +122,39 @@ before its next request, so the user can redirect work already in progress.")
 
 (defun run (prompt &key (agent (or *agent* (make-agent))) (print-response t))
   "Run one user PROMPT through AGENT until the model stops calling Lisp.
-Prompts typed while the model works are delivered before its next request."
+Prompts typed while the model works are delivered before its next request.
+With PRINT-RESPONSE, tool calls and replies are printed as they arrive;
+otherwise they are only recorded. Returns the final reply."
   ;; Nested runs (including tests invoked by a tool) must restore the caller.
-  (let ((*agent* agent)
-        (*steering* '()))
+  (let* (;; A run of another agent inside this one, such as tests a tool call
+         ;; starts, keeps its entries out of the session's transcript.
+         (*session-entries* (if (and *agent* (not (eq agent *agent*)))
+                                (make-entry-vector)
+                                *session-entries*))
+         (*show-entries* print-response)
+         (*agent* agent)
+         (*steering* '()))
     (setf (agent-history agent)
           (append (agent-history agent)
                   (list (json-object "role" "user" "content" prompt))))
+    ;; The prompt line already shows what the user typed.
+    (record-entry :user prompt :show nil)
     (loop
       (inject-steering agent)
       (let* ((response (invoke-model agent))
              (message (assistant-message response))
-             (tool-calls (get-key message "tool_calls")))
+             (tool-calls (get-key message "tool_calls"))
+             (content (message-content message)))
         (setf (agent-history agent)
               (append (agent-history agent) (list message)))
+        (when (plusp (length content))
+          (record-entry :assistant content))
         (if (and (vectorp tool-calls) (plusp (length tool-calls)))
             (loop for call across tool-calls
                   do (setf (agent-history agent)
                            (append (agent-history agent)
                                    (list (execute-tool-call agent call)))))
-            (let ((content (message-content message)))
-              (when (and print-response (plusp (length content)))
-                (format t "~&~A~%" content))
-              ;; A prompt typed while the model was answering continues the turn.
-              (unless (steering-pending-p)
-                (finish-pending-image)
-                (return content))))))))
+            ;; A prompt typed while the model was answering continues the turn.
+            (unless (steering-pending-p)
+              (finish-pending-image)
+              (return content)))))))

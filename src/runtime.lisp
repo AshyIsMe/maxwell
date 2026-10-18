@@ -150,10 +150,13 @@ call shares its prompt-cache prefix.")
         (push form forms)
         (setf position end)))))
 
+(defvar *color*)                        ; see style.lisp
+
 (defun eval-lisp (code &key (package (find-package '#:maxwell/workspace))
                              (directory (and *agent* (agent-workspace *agent*))))
   "Evaluate every form in CODE, retaining definitions in PACKAGE.
-Returns a printable transcript rather than signaling evaluation errors."
+Returns a printable transcript rather than signaling evaluation errors, and as
+a second value whether evaluation signalled an error."
   (let ((output (make-string-output-stream))
         (values '()))
     (handler-case
@@ -161,20 +164,24 @@ Returns a printable transcript rather than signaling evaluation errors."
               (*standard-output* output)
               (*error-output* output)
               (*trace-output* output)
+              ;; What the code prints goes to the model: never style it.
+              (*color* nil)
               (*default-pathname-defaults* (or directory *default-pathname-defaults*)))
           (dolist (form (read-forms code))
             (setf values (multiple-value-list (eval form))))
           (let ((printed (render-values values))
                 (transcript (get-output-stream-string output)))
-            (if (zerop (length transcript))
-                printed
-                (format nil "~A~%=> ~A" transcript printed))))
+            (values (if (zerop (length transcript))
+                        printed
+                        (format nil "~A~%=> ~A" transcript printed))
+                    nil)))
       (error (condition)
         (let ((transcript (get-output-stream-string output)))
-          (format nil "~@[~A~%~]~A: ~A"
-                  (and (plusp (length transcript)) transcript)
-                  (type-of condition)
-                  condition))))))
+          (values (format nil "~@[~A~%~]~A: ~A"
+                          (and (plusp (length transcript)) transcript)
+                          (type-of condition)
+                          condition)
+                  t))))))
 
 (defun save-image (path &key (executable t))
   "Save the entire running Maxwell state and terminate this SBCL process."
