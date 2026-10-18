@@ -41,7 +41,8 @@
            (agent (maxwell:make-agent :model-function model)))
       (check (string= "The answer is 42."
                       (maxwell:run "Calculate it." :agent agent :print-response nil)))
-      (check (= 4 (length (maxwell:agent-history agent)))))))
+      ;; The view, the message, the tool call, its result, and the reply.
+      (check (= 5 (length (maxwell:agent-history agent)))))))
 
 (defun entries-text (entries)
   (format nil "~{~A~^~%~}" (map 'list #'maxwell::entry-text entries)))
@@ -49,6 +50,7 @@
 (defun test-nested-agent-run ()
   (let* ((outer (maxwell:make-agent))
          (maxwell:*agent* outer)
+         (maxwell:*chat* (maxwell::make-chat))
          (maxwell::*session-entries* (maxwell::make-entry-vector))
          (responses
            (list (fake-response
@@ -68,9 +70,13 @@
     (check (search "Run tests." (entries-text maxwell::*session-entries*)))
     (check (equal '(:user :tool :echo :assistant)
                   (map 'list #'maxwell::entry-kind maxwell::*session-entries*)))
+    ;; The nested run logged its messages in a chat of its own.
+    (check (equal '(:user :tool :echo :maxwell)
+                  (map 'list #'maxwell::message-kind (maxwell::chat-messages maxwell:*chat*))))
     (check (string= "Still here."
                     (maxwell:run "Continue." :print-response nil)))
-    (check (= 6 (length (maxwell:agent-history outer)))))
+    ;; No conversation carries over: each turn starts from the view.
+    (check (= 3 (length (maxwell:agent-history outer)))))
   ;; Restore the caller even when a nested provider fails.
   (let* ((outer (maxwell:make-agent))
          (maxwell:*agent* outer)
@@ -434,7 +440,8 @@
 
 (defun test-steering-run ()
   ;; A prompt typed while the model works reaches it before the next request.
-  (let* ((requests '())
+  (let* ((maxwell:*chat* (maxwell::make-chat))
+         (requests '())
          (calls 0)
          (model (lambda (messages tools)
                   (declare (ignore tools))
@@ -453,9 +460,15 @@
                     (maxwell:run "Explain." :agent agent :print-response nil)))
     (check (= 2 calls))
     (check (member "be brief" (first requests) :test #'string=))
-    (check (= 5 (length (maxwell:agent-history agent)))))
+    (check (= 6 (length (maxwell:agent-history agent))))
+    ;; Steering is logged as the user's words, after the tool call.
+    (check (equal '(:user :tool :echo :user :maxwell)
+                  (map 'list #'maxwell::message-kind (maxwell::chat-messages maxwell:*chat*))))
+    (check (eql 3 (maxwell::entry-id (find :steer maxwell::*session-entries*
+                                           :key #'maxwell::entry-kind :from-end t)))))
   ;; A prompt typed while the model is answering continues the turn.
-  (let* ((calls 0)
+  (let* ((maxwell:*chat* (maxwell::make-chat))
+         (calls 0)
          (model (lambda (messages tools)
                   (declare (ignore messages tools))
                   (incf calls)
@@ -464,9 +477,9 @@
          (agent (maxwell:make-agent :model-function model)))
     (check (string= "reply 2" (maxwell:run "Go." :agent agent :print-response nil)))
     (check (= 2 calls))
-    (check (= 4 (length (maxwell:agent-history agent))))
+    (check (= 5 (length (maxwell:agent-history agent))))
     (check (string= "one more thing"
-                    (maxwell/json:get-key (third (maxwell:agent-history agent))
+                    (maxwell/json:get-key (fourth (maxwell:agent-history agent))
                                           "content")))))
 
 (defun test-async-command ()
@@ -700,6 +713,11 @@
         (maxwell::*older-entries-function* nil)
         (maxwell::*color* nil)
         (maxwell::*pending-image* nil)
+        ;; Nor the live chat, its lock, or its image.
+        (maxwell:*chat* (maxwell::make-chat))
+        (maxwell::*checkpoint-path* nil)
+        (maxwell::*lock-fd* nil)
+        (maxwell::*busy-text* nil)
         (maxwell::*prompt-history* '())
         (maxwell::*prompt-kill* "")
         ;; Never touch the real remembered session while testing.
@@ -727,6 +745,14 @@
     (test-provider-presets)
     (test-steering-input)
     (test-steering-run)
+    (test-turn-assembly)
+    (test-turn-logging)
+    (test-summary-wait)
+    (test-log-paging)
+    (test-image-paths-and-lock)
+    (test-chat-transplant)
+    (test-startup-migration)
+    (test-command-line)
     (test-async-command)
     (test-terminal)
     (test-prompt-editing)

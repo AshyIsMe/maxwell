@@ -1,12 +1,12 @@
 (in-package #:maxwell)
 
-(defparameter *prompt-history* '()
+(defvar *prompt-history* '()
   "Prompts submitted at the interactive prompt, most recent first.")
 
 (defparameter *prompt-history-limit* 200
   "Maximum number of remembered prompts.")
 
-(defparameter *prompt-kill* ""
+(defvar *prompt-kill* ""
   "Text removed by the most recent kill command (Ctrl-U, Ctrl-W, Ctrl-K).")
 
 (defun remember-prompt (text)
@@ -152,7 +152,7 @@ the next prompt instead of being discarded.")
 
 (defun editor-visible-width (editor)
   (max 1 (- (prompt-editor-columns editor)
-            (length (prompt-editor-prompt editor)) 2)))
+            (visible-length (prompt-editor-prompt editor)) 2)))
 
 (defun editor-redraw (editor)
   (let* ((output (prompt-editor-output editor))
@@ -258,15 +258,33 @@ the next prompt instead of being discarded.")
         (progn (editor-erase editor)
                (print-entry (make-entry :user text) output)))))
 
-(defun read-terminal-prompt (agent input output)
+(defun stream-fd (stream)
+  "The file descriptor under STREAM, following synonym streams, or NIL."
+  (loop while (typep stream 'synonym-stream)
+        do (setf stream (symbol-value (synonym-stream-symbol stream))))
+  (and (typep stream 'sb-sys:fd-stream) (sb-sys:fd-stream-fd stream)))
+
+(defun await-key (input idle)
+  "Return once a key, or end of file, is waiting on INPUT, calling IDLE about
+every 50 ms meanwhile. Without IDLE, or on a stream that is not a file, return
+at once and let the read block."
+  (let ((fd (and idle (stream-fd input))))
+    (when fd
+      ;; LISTEN sees buffered keys; the descriptor also reports end of file,
+      ;; which LISTEN does not.
+      (loop until (or (listen input) (sb-sys:wait-until-fd-usable fd :input 0.05))
+            do (funcall idle)))))
+
+(defun read-terminal-prompt (agent input output &key idle)
   "Read one prompt line with readline-style editing: Up/Down recall previous
 prompts, PgUp opens the transcript, Ctrl-T expands or collapses tool calls,
-and Ctrl-A/E/B/F/U/W/K/Y/L edit the line."
+and Ctrl-A/E/B/F/U/W/K/Y/L edit the line. IDLE, when given, is called while
+no key arrives, so background work such as compaction continues."
   (declare (ignorable agent))
   (let ((editor (make-prompt-editor agent input output :text *prompt-draft*)))
     (setf *prompt-draft* "")
     (editor-redraw editor)
-    (loop for key = (terminal-key input)
+    (loop for key = (progn (await-key input idle) (terminal-key input))
           for action = (editor-key editor key)
           do (case action
                (:browse (browse-transcript input output))
@@ -324,7 +342,14 @@ PgUp/PgDn browse the transcript and Ctrl-T redraws it with tool calls expanded
 or collapsed; the steering line is drawn again afterwards."
   (let* ((editor (steering-session-editor session))
          (input (prompt-editor-input editor))
-         (handled nil))
+         (handled nil)
+         (prompt (if *busy-text*
+                     (format nil "~A steer> " (styled :dim *busy-text*))
+                     "steer> ")))
+    ;; A turn waiting for summaries shows a spinner before the prompt.
+    (unless (string= prompt (prompt-editor-prompt editor))
+      (setf (prompt-editor-prompt editor) prompt
+            (steering-session-shown session) nil))
     (loop while (listen input)
           do (setf handled t)
              (let ((key (terminal-key input)))
@@ -343,12 +368,21 @@ or collapsed; the steering line is drawn again afterwards."
     handled))
 
 (defun read-interactive-prompt (agent)
+  "Read the next prompt line, or NIL at end of input. Ctrl-C discards the line
+being typed and returns an empty one."
+  (handler-case (read-interactive-line agent)
+    (sb-sys:interactive-interrupt ()
+      (fresh-line)
+      "")))
+
+(defun read-interactive-line (agent)
   (let ((state (interactive-terminal-state)))
     (if state
         (unwind-protect
              (progn
                (terminal-command "-icanon" "-echo" "min" "1" "time" "0")
-               (read-terminal-prompt agent *standard-input* *standard-output*))
+               (read-terminal-prompt agent *standard-input* *standard-output*
+                                     :idle (lambda () (tick-compactor agent))))
           (terminal-command state))
         (progn
           (format t "~&maxwell> ")

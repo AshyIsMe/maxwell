@@ -6,6 +6,7 @@ import json
 import os
 import pty
 import select
+import shutil
 import signal
 import socketserver
 import struct
@@ -87,7 +88,8 @@ if pid == 0:
     os.environ['XDG_DATA_HOME'] = os.path.join(scratch, 'data')
     # Plain text keeps the markers below contiguous.
     os.environ['NO_COLOR'] = '1'
-    os.execv(executable, [executable, '--base-url', base_url, '--model', 'pty-model'])
+    os.execv(executable, [executable, '--base-url', base_url, '--model', 'pty-model',
+                          '--compact-model', 'pty-compact'])
 
 pending = b''
 
@@ -111,7 +113,12 @@ def send(data):
 
 
 def steering_messages(request):
-    return [m.get('content') for m in request['messages'] if m.get('role') == 'user']
+    """The user's words in REQUEST: each turn starts with the view, then the
+    turn state followed by the message."""
+    users = [m.get('content') for m in request['messages'] if m.get('role') == 'user']
+    assert users[0].startswith('<chat>'), users
+    assert users[1].startswith('Date: '), users
+    return [users[1].rsplit('\n\n', 1)[-1]] + users[2:]
 
 
 try:
@@ -173,7 +180,8 @@ try:
     expect(b'maxwell> ')
 
     send(b'/quit' + ENTER)
-    deadline = time.monotonic() + 5
+    # Quitting saves the chat to the (scratch) global image first.
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         finished, status = os.waitpid(pid, os.WNOHANG)
         if finished:
@@ -192,3 +200,5 @@ finally:
         pass
     os.close(terminal)
     server.shutdown()
+    # Quitting saved the chat to a large image in the scratch directory.
+    shutil.rmtree(scratch, ignore_errors=True)

@@ -59,7 +59,9 @@ directly; zoom is your only allowed mechanism to navigate the tree. Summaries
 keep little of tool output, so say in your reply what you learned that will
 matter later.
 
-Messages the user sends while you work reach you between tool calls.
+The user's new message starts with the turn's state: the date, the workspace
+directory your tool runs in, and your model. Messages the user sends while you
+work reach you between tool calls.
 
 To preserve the entire live agent, including its memory, loaded code, and Lisp
 state, as a resumable executable SBCL image, evaluate
@@ -108,13 +110,23 @@ call shares its prompt-cache prefix.")
 
 (defstruct (agent (:constructor %make-agent))
   client
+  ;; The turn in progress only: each turn starts from the view again.
   (history '() :type list)
   (workspace (uiop:getcwd) :type pathname)
   (system-prompt *base-system-prompt* :type string)
-  model-function)
+  model-function
+  ;; Called like MODEL-FUNCTION to build summaries. NIL means the client's
+  ;; compact model, unless MODEL-FUNCTION is set: a fake model never makes
+  ;; real compaction requests.
+  compact-function)
 
-(defparameter *pending-image* nil)
-(defparameter *agent* nil)
+;; DEFVAR, not DEFPARAMETER: /reload loads this file into the running session.
+(defvar *pending-image* nil)
+(defvar *agent* nil)
+
+(defvar *checkpoint-path* nil
+  "The global image this session saves itself to, or NIL for a session that
+never saves, such as --ephemeral. See image.lisp.")
 
 (defun workspace-path (path)
   "Resolve PATH relative to the active agent's workspace."
@@ -188,6 +200,7 @@ a second value whether evaluation signalled an error."
   #+sbcl
   (progn
     (setf *pending-image* nil)
+    (forget-session-state)
     (ensure-directories-exist path)
     (format t "~&Saving Maxwell image to ~A~%" path)
     (finish-output)

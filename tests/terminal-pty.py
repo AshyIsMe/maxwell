@@ -2,6 +2,7 @@
 python3 tests/terminal-pty.py."""
 import os
 import fcntl
+import shutil
 import re
 import struct
 import tempfile
@@ -57,7 +58,8 @@ class Session:
 
     def quit(self, original=None):
         self.send(b'/quit\r')
-        deadline = time.monotonic() + 5
+        # Quitting saves the chat to the (scratch) global image first.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             finished, status = os.waitpid(self.pid, os.WNOHANG)
             if finished:
@@ -103,7 +105,7 @@ try:
     session.expect(b'\x1b[3J')
     session.expect(b'maxwell> /he')
     session.send(b'lp\r')
-    session.expect(b'/quit           exit')
+    session.expect(b'/quit          save the chat and exit')
     session.expect(b'press Enter to steer the model')
     session.expect(b'maxwell> ')
     session.quit(original)
@@ -127,5 +129,7 @@ for arguments, environment, coloured in (((), {}, True),
     finally:
         session.close()
 
+# Quitting saved the chat to a large image in the scratch directory.
+shutil.rmtree(scratch, ignore_errors=True)
 print('Terminal startup, /help, PgUp/PgDn, Ctrl-T redraws, draft preservation, '
       'colour selection, and restoration passed.')

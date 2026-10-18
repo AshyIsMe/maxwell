@@ -20,10 +20,11 @@
                (:file "src/render")
                (:file "src/agent")
                (:file "src/terminal")
+               (:file "src/image")
                (:file "src/cli"))
   :build-operation "program-op"
   :build-pathname "maxwell"
-  :entry-point "maxwell:main"
+  :entry-point "maxwell::image-main"
   :in-order-to ((test-op (test-op "maxwell/tests"))))
 
 (asdf:defsystem "maxwell/tests"
@@ -33,6 +34,7 @@
                (:file "tests/support")
                (:file "tests/ui-tests")
                (:file "tests/memory-tests")
+               (:file "tests/session-tests")
                (:file "tests/tests"))
   :perform (test-op (operation component)
              (declare (ignore operation component))
