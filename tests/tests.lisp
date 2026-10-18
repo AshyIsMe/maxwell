@@ -1,32 +1,5 @@
 (in-package #:maxwell/tests)
 
-(defvar *failures* 0)
-
-(defmacro check (form)
-  `(unless ,form
-     (incf *failures*)
-     (format *error-output* "FAIL: ~S~%" ',form)))
-
-(defun fake-response (&key content tool-calls)
-  (maxwell/json:json-object
-    "choices"
-    (maxwell/json:json-array
-      (maxwell/json:json-object
-        "message"
-        (let ((message (maxwell/json:json-object "role" "assistant"
-                                                 "content" (or content maxwell/json:+null+))))
-          (when tool-calls (setf (gethash "tool_calls" message) tool-calls))
-          message)))))
-
-(defun tool-call (code)
-  (maxwell/json:json-object
-    "id" "call-1"
-    "type" "function"
-    "function" (maxwell/json:json-object
-                  "name" "common_lisp"
-                  "arguments" (maxwell/json:encode
-                                 (maxwell/json:json-object "code" code)))))
-
 (defun test-json ()
   (let* ((source "{\"name\":\"Maxwell\\n\",\"ok\":true,\"xs\":[1,null,false]}")
          (decoded (maxwell/json:decode source))
@@ -546,6 +519,8 @@
     (test-terminal)
     (test-prompt-editing)
     (test-prompt-history)
+    (run-ui-tests)
+    (run-memory-tests)
     (format t "~&~:[~D Maxwell test(s) failed~;All Maxwell tests passed~].~%"
             (zerop *failures*) *failures*)
     (zerop *failures*)))
