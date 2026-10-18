@@ -182,7 +182,8 @@ ENVIRONMENT names the lookup for MAXWELL_* variables, which tests replace."
                                        (getf defaults :api-key-environment)
                                        "OPENAI_API_KEY")
               :auth-provider auth-provider
-              :extra-headers (or headers (getf remembered :extra-headers)))))))
+              :extra-headers (or headers (getf remembered :extra-headers))
+              :effort (getf remembered :effort))))))
 
 (defun adopt-openai-client (client)
   "Point CLIENT at the ChatGPT-plan Responses endpoint with a Codex model, and
@@ -196,16 +197,20 @@ remember it as the provider of this session."
 (defun adopt-safeai-client (client model)
   "Point CLIENT at Safe AI Labs Chat Completions with MODEL, and remember it as
 the provider of this session."
-  (setf (client-base-url client) (trim-slashes (safeai-base-url))
-        (client-endpoint client) nil
-        (client-wire-api client) :chat-completions
-        (client-auth-provider client) :safeai
-        (client-api-key-environment client) +safeai-api-key-environment+
-        ;; Headers and request fields belonged to the previous provider; the
-        ;; ChatGPT plan's stream:true in particular would break Chat Completions.
-        (client-extra-headers client) '()
-        (client-request-fields client) nil
-        (client-model client) model)
+  (let ((effort (client-effort client)))
+    (setf (client-base-url client) (trim-slashes (safeai-base-url))
+          (client-endpoint client) nil
+          (client-wire-api client) :chat-completions
+          (client-auth-provider client) :safeai
+          (client-api-key-environment client) +safeai-api-key-environment+
+          ;; Headers and request fields belonged to the previous provider; the
+          ;; ChatGPT plan's stream:true in particular would break Chat
+          ;; Completions. The thinking effort belongs to the session, so it
+          ;; stays, and is sent in the new provider's spelling.
+          (client-extra-headers client) '()
+          (client-request-fields client) nil
+          (client-model client) model)
+    (when effort (set-client-effort client effort)))
   (remember-client client)
   client)
 
@@ -228,6 +233,7 @@ the provider of this session."
           *login-providers*))
 
 (defun print-model-catalog (agent)
+  (status-bar-hide)
   (let* ((client (agent-client agent))
          (models (list-provider-models client)))
     (format t "~&Current model: ~A~%~A~%"
@@ -240,6 +246,7 @@ the provider of this session."
     models))
 
 (defun select-model (agent model-id)
+  (status-bar-hide)
   (when (zerop (length model-id))
     (error "Usage: /model MODEL"))
   (let ((models (list-provider-models (agent-client agent))))
@@ -249,27 +256,63 @@ the provider of this session."
     (remember-client (agent-client agent))
     (format t "~A~%" (styled :dim (format nil "Selected model: ~A" model-id)))))
 
+;;; Thinking effort
+
+(defparameter *thinking-levels* '("none" "minimal" "low" "medium" "high")
+  "The thinking levels /effort accepts. A provider that takes others can be
+given one with --request-json.")
+
+(defun set-effort (client level)
+  "Set CLIENT's thinking LEVEL, or clear it with default. The choice is
+remembered with the model. Returns the level, or NIL for the provider's own
+default."
+  (let ((level (string-downcase (string-trim '(#\Space #\Tab) level))))
+    (cond
+      ((member level '("default" "unset" "clear" "-") :test #'string=)
+       (set-client-effort client nil))
+      ((member level *thinking-levels* :test #'string=)
+       (set-client-effort client level))
+      (t
+       (error "Unknown thinking level ~S. Try ~{~A~^, ~}, or default."
+              level *thinking-levels*)))
+    (remember-client client)
+    (client-effort client)))
+
+(defun effort-command (client argument)
+  "The /effort command: say CLIENT's thinking effort, or set it from ARGUMENT."
+  (let ((argument (string-trim '(#\Space #\Tab) argument)))
+    (if (zerop (length argument))
+        (format t "~&Thinking effort: ~A. Use /effort LEVEL, one of ~{~A~^, ~}, ~
+                   or /effort default.~%"
+                (or (client-effort client) "the provider's default")
+                *thinking-levels*)
+        (format t "~&Thinking effort: ~A.~%"
+                (or (set-effort client argument) "the provider's default")))))
+
 (defun run-interactive-turn (line agent)
   "Run LINE, keeping the prompt live while the model works so that the user can
 browse the transcript and queue steering prompts. The compactor keeps working
 meanwhile."
-  (let ((state (interactive-terminal-state)))
-    (if (null state)
-        (run line :agent agent)
-        (unwind-protect
-             (progn
-               (terminal-command "-icanon" "-echo" "min" "1" "time" "0")
-               (let* ((session (make-steering-session agent *standard-input*
-                                                      *standard-output*))
-                      (*input-poll* (lambda ()
-                                      (service-steering-input session)
-                                      (tick-compactor agent)))
-                      (*input-hide* (lambda () (steering-hide session))))
-                 (unwind-protect (run line :agent agent)
-                   (steering-hide session)
-                   ;; An unfinished steering line becomes the next prompt.
-                   (setf *prompt-draft* (steering-draft session)))))
-          (terminal-command state)))))
+  (set-activity :idle)
+  (unwind-protect
+       (let ((state (interactive-terminal-state)))
+         (if (null state)
+             (run line :agent agent)
+             (unwind-protect
+                  (progn
+                    (terminal-command "-icanon" "-echo" "min" "1" "time" "0")
+                    (let* ((session (make-steering-session agent *standard-input*
+                                                           *standard-output*))
+                           (*input-poll* (lambda ()
+                                           (service-steering-input session)
+                                           (tick-compactor agent)))
+                           (*input-hide* (lambda () (steering-hide session))))
+                      (unwind-protect (run line :agent agent)
+                        (steering-hide session)
+                        ;; An unfinished steering line becomes the next prompt.
+                        (setf *prompt-draft* (steering-draft session)))))
+               (terminal-command state))))
+    (set-activity :idle)))
 
 ;;; Reading the log back
 
@@ -297,7 +340,9 @@ from message START, where this session began, as transcript entries."
   (record-entry :status (apply #'format nil control arguments) :show t))
 
 (defun report-error (control &rest arguments)
-  "Print an error message on *ERROR-OUTPUT* in the :error face."
+  "Print an error message on *ERROR-OUTPUT* in the :error face, with the status
+bar out of the way."
+  (status-bar-hide)
   (format *error-output* "~&~A~%" (styled :error (apply #'format nil control arguments))))
 
 (defun save-session (&key quiet)
@@ -318,6 +363,9 @@ QUIET. True unless saving failed."
 /logout NAME   forget a saved login
 /model         list current provider's available models
 /model MODEL   select an available model
+/effort        show the model's thinking effort
+/effort LEVEL  set it: none, minimal, low, medium, or high
+/statusbar     show or hide the status bar above the prompt
 /memory        show the chat's size, summaries, and compactor jobs
 /import PATH   read a file into memory as a note
 /checkpoint    save the chat to the global image and keep going
@@ -391,6 +439,15 @@ before its next request.")
              (select-model *agent* (command-argument line "/model "))
            (error (condition)
              (report-error "Could not select model: ~A" condition))))
+        ((or (command-p line "/statusbar")
+             (command-argument line "/statusbar "))
+         (status-bar-command line (session-client)))
+        ((or (command-p line "/effort") (command-argument line "/effort "))
+         (handler-case
+             (effort-command (agent-client *agent*)
+                             (or (command-argument line "/effort ") ""))
+           (error (condition)
+             (report-error "Could not set the thinking effort: ~A" condition))))
         ((command-p line "/memory")
          (status "~A~%image: ~A" (memory-report *chat*)
                  (if *checkpoint-path* (native *checkpoint-path*) "none (ephemeral)")))

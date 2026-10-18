@@ -84,6 +84,23 @@ session = Session()
 try:
     original = termios.tcgetattr(session.terminal)
     session.expect(b'maxwell> ')
+    # A dim status row sits directly above the prompt, and /statusbar takes it
+    # away and brings it back. Submitting output moves the cursor up into the
+    # row and clears it, so the transcript never collides with the bar.
+    assert b'\r\x1b[2K\x1b[2mopenai/no model  idle\x1b[0m' in session.seen, session.seen
+    marked = len(session.seen)
+    session.send(b'/statusbar off\r')
+    session.expect(b'\x1b[A\r\x1b[2K')
+    assert b'idle' not in session.seen[marked:], session.seen[marked:]
+    session.send(b'/statusbar on\r')
+    session.expect(b'openai/no model  idle')
+    # /effort shows and sets the session's thinking effort.
+    session.send(b'/effort high\r')
+    session.expect(b'Thinking effort: high.')
+    session.send(b'/effort\r')
+    session.expect(b'Thinking effort: high. Use /effort LEVEL')
+    session.send(b'/effort default\r')
+    session.expect(b"Thinking effort: the provider's default.")
     # Preserve a partially typed command through transcript browsing.
     session.send(b'/he\x1b[5~')
     session.expect(b'PgUp/PgDn scroll')

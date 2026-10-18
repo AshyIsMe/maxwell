@@ -289,6 +289,18 @@ messages in the first element of REQUESTS."
     (check (string= "cheap" (maxwell:client-model (maxwell::compaction-client cheap))))
     (check (string= "main" (maxwell:client-model cheap)))
     (check (eq main (maxwell::compaction-client main)))
+    ;; The compaction client never asks for a thinking effort, and the client
+    ;; it came from keeps its own.
+    (let ((effortful (maxwell:make-client :model "main" :effort "high"))
+          (both (maxwell:make-client :model "main" :compact-model "cheap"
+                                     :effort "high")))
+      (check (string= "high" (maxwell::client-effort effortful)))
+      (check (null (maxwell::client-effort (maxwell::compaction-client effortful))))
+      (check (string= "high" (maxwell::client-effort effortful)))
+      (let ((compaction (maxwell::compaction-client both)))
+        (check (string= "cheap" (maxwell:client-model compaction)))
+        (check (null (maxwell::client-effort compaction)))
+        (check (string= "high" (maxwell::client-effort both)))))
     (check (null (maxwell::compact-model-warning cheap)))
     (check (search "main" (maxwell::compact-model-warning main)))
     (check (null (maxwell::compact-model-warning main))))

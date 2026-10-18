@@ -55,11 +55,14 @@
     message))
 
 (defun invoke-model (agent)
-  (if (agent-model-function agent)
-      (funcall (agent-model-function agent) (wire-messages agent)
-               (json-array (common-lisp-tool)))
-      (call-provider (agent-client agent) (wire-messages agent)
-                     (json-array (common-lisp-tool)))))
+  (set-activity :thinking)
+  (multiple-value-prog1
+      (if (agent-model-function agent)
+          (funcall (agent-model-function agent) (wire-messages agent)
+                   (json-array (common-lisp-tool)))
+          (call-provider (agent-client agent) (wire-messages agent)
+                         (json-array (common-lisp-tool))))
+    (set-activity :responding)))
 
 ;;; Logging
 
@@ -95,14 +98,22 @@ a transcript entry carrying its id. Returns the entry."
           (error (condition)
             (values (format nil "Tool argument error: ~A" condition) nil))))))
 
+(defun tool-call-name (call)
+  "The name of the function CALL invokes, for the status bar."
+  (get-key (get-key call "function") "name"))
+
 (defun execute-tool-call (agent call)
   "Run CALL and return its tool message. The call and its result are logged
 and recorded as they happen; the message keeps the whole result, while the
 log clips a long one."
-  (log-entry :tool (tool-call-text call) :agent agent)
-  (multiple-value-bind (result ok-p) (evaluate-tool-call agent call)
-    (log-entry :echo result :ok-p ok-p :agent agent)
-    (tool-result-message call result)))
+  (set-activity :tooling (tool-call-name call))
+  (multiple-value-prog1
+      (progn
+        (log-entry :tool (tool-call-text call) :agent agent)
+        (multiple-value-bind (result ok-p) (evaluate-tool-call agent call)
+          (log-entry :echo result :ok-p ok-p :agent agent)
+          (tool-result-message call result)))
+    (set-activity :thinking)))
 
 (defun message-content (message)
   (let ((content (get-key message "content")))
@@ -196,6 +207,7 @@ Returns true when the view is complete."
   (let ((chat *chat*))
     (when (summarized-before-p chat id)
       (return-from await-summaries t))
+    (set-activity :summarizing)
     (record-entry :status "Summarizing earlier messages before sending… (Ctrl-C sends now)")
     (let ((deadline (+ (get-internal-real-time)
                        (* *summary-wait-limit* internal-time-units-per-second)))
@@ -229,6 +241,7 @@ Returns true when the view is complete."
                               outcome (chat-leaf-frontier chat)
                               (- id (chat-leaf-frontier chat)))
                       :ok-p nil))
+      (set-activity :thinking)
       (eq outcome :done))))
 
 ;;; The turn

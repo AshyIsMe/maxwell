@@ -59,7 +59,10 @@ older than the session.")
   "Start an empty transcript, as at startup or when an image resumes."
   (setf *session-entries* (make-entry-vector)
         *row-cache-width* nil)
-  (clear-row-cache))
+  (clear-row-cache)
+  ;; The screen is new, so nothing of the status bar is left on it.
+  (status-bar-forget)
+  (set-activity :idle))
 
 (defun toggle-tool-display ()
   "Switch every tool call between summary and full display."
@@ -323,7 +326,9 @@ they have been rendered before."
 result, and the pair is printed then."
   (let ((entry (aref entries index)))
     (unless (eq (entry-kind entry) :tool)
-      ;; The steering line must go away before the transcript grows.
+      ;; The status bar and the steering line must go away before the
+      ;; transcript grows.
+      (status-bar-hide stream)
       (when *input-hide* (funcall *input-hide*))
       (write-rows (entry-rows entries (if (paired-echo-p entries index) (1- index) index)
                               (live-width stream))
@@ -543,6 +548,7 @@ current tool display mode, about two pages of them. The caller redraws its
 prompt line afterwards."
   (multiple-value-bind (rows columns) (terminal-size)
     (multiple-value-bind (lines more) (transcript-tail *session-entries* (1- columns) rows)
+      (status-bar-forget)
       (format output "~C[H~C[2J~C[3J" #\Escape #\Escape #\Escape)
       (when more
         (write-line (styled :dim "… earlier history: PgUp") output))

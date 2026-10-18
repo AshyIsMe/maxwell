@@ -371,7 +371,46 @@ fn main() {}") :rust))
       (check (search (esc "~[2m› two~[0m") text))
       (check (search (esc "~[2mc~[0m") text)))))
 
+(defun test-status-bar ()
+  (let ((maxwell::*color* nil)
+        (maxwell::*status-bar-enabled* t)
+        (maxwell::*status-bar-state* :idle)
+        (maxwell::*status-bar-detail* nil)
+        (maxwell::*status-bar-visible* nil)
+        (maxwell::*status-bar-drawn* "")
+        (client (maxwell:make-client :model "gpt-5" :auth-provider :safeai)))
+    ;; Which provider and model answers, and what Maxwell is doing.
+    (check (string= "safeai/gpt-5  idle" (maxwell::status-bar-text client)))
+    (maxwell::set-activity :tooling "common_lisp")
+    (check (string= "safeai/gpt-5  tooling · common_lisp"
+                    (maxwell::status-bar-text client)))
+    (maxwell::set-activity :idle)
+    ;; A base URL names the provider when no login is remembered.
+    (check (string= "openai" (maxwell::status-bar-host-label "https://api.openai.com/v1")))
+    (check (string= "safeailabs"
+                    (maxwell::status-bar-host-label "https://us-region.api.safeailabs.ai/v1")))
+    (check (string= "localhost"
+                    (maxwell::status-bar-host-label "http://localhost:8080/v1")))
+    (check (string= "no model" (maxwell::status-bar-model nil)))
+    ;; The row is clipped to the terminal width, and nothing is drawn off a
+    ;; terminal.
+    (check (= 8 (length (maxwell::status-bar-row client 10))))
+    (check (string= "…" (subseq (maxwell::status-bar-row client 10) 7)))
+    (let ((out (make-string-output-stream)))
+      (maxwell::status-bar-show out 40 client)
+      (check (string= "" (get-output-stream-string out)))
+      (check (null maxwell::*status-bar-visible*)))
+    ;; /statusbar turns it off and on again.
+    (let ((*standard-output* (make-string-output-stream)))
+      (maxwell::status-bar-command "/statusbar off" client)
+      (check (null maxwell::*status-bar-enabled*))
+      (maxwell::status-bar-command "/statusbar" client)
+      (check maxwell::*status-bar-enabled*)
+      (maxwell::status-bar-command "/statusbar on" client)
+      (check maxwell::*status-bar-enabled*))))
+
 (defun run-ui-tests ()
+  (test-status-bar)
   (test-tool-blocks)
   (test-lazy-viewer)
   (test-recent-exchanges)

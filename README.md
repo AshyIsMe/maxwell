@@ -184,7 +184,7 @@ The record lives at `~/.config/maxwell/session.json` (override it with
 `MAXWELL_SESSION_FILE`). Maxwell writes it whenever a session starts, when
 `/model MODEL` selects a model, and after `/login`. It holds the base URL,
 endpoint, wire API, credential variable name, login provider, extra headers,
-and model.
+model, and thinking effort.
 
 Command-line options and `MAXWELL_*` environment variables always win. Naming a
 provider explicitly—`--base-url`, `--endpoint`, `--wire-api`, `--api-key-env`,
@@ -197,6 +197,14 @@ Credentials are never copied into the record: they still come from the
 environment variable the provider names, or from the saved login. Delete
 `session.json` to forget the last session; if it cannot be written, Maxwell
 simply starts without a remembered default.
+
+Some models take a thinking-effort level. `/effort` shows the current one;
+`/effort LEVEL` sets it to `none`, `minimal`, `low`, `medium`, or `high`, and
+`/effort default` clears it. It reaches the provider in that provider's own
+spelling—a `reasoning` object on Responses, `reasoning_effort` on Chat
+Completions—and is remembered in `session.json` with the model. Memory
+summaries never ask for an effort: they are mechanical. A provider that takes
+other levels can be given one with `--request-json`.
 
 Responses requests with `"stream":true` are read as server-sent events.
 Maxwell waits for `response.completed`, then feeds that complete response into
@@ -353,6 +361,16 @@ Linux). Redirected input/output and `TERM=dumb` retain ordinary line input.
 The viewer shows conversation messages, not every CLI status line, and terminal
 dimensions are read when it opens. A resumed chat starts by showing its last
 two exchanges, dimmed.
+
+### The status bar
+
+On an interactive terminal, a dim row sits directly above the prompt, showing
+which provider and model is answering and what Maxwell is doing: idle,
+thinking, responding, tooling, summarizing, or saving. Anything printed to the
+transcript clears the row first and the next prompt draws it again, so it never
+disturbs what is already on screen. `/statusbar` turns it off and on, and
+`/statusbar on` or `/statusbar off` says which. Redirected input and output have
+no status bar.
 
 ### Steering the model while it works
 

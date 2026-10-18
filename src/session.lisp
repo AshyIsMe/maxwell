@@ -57,7 +57,8 @@
             :auth-provider (session-keyword provider "auth_provider")
             :extra-headers (session-headers provider)
             :model (session-string record "model")
-            :compact-model (session-string record "compact_model")))))
+            :compact-model (session-string record "compact_model")
+            :effort (session-string record "effort")))))
 
 (defun session-record-for-client (client)
   "Describe CLIENT's provider and model as a JSON object."
@@ -65,6 +66,7 @@
     "version" +session-version+
     "model" (client-model client)
     "compact_model" (or (client-compact-model client) +null+)
+    "effort" (or (client-effort client) +null+)
     "provider"
     (json-object
       "base_url" (client-base-url client)

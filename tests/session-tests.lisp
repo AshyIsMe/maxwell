@@ -290,6 +290,28 @@ REQUESTS and answers with REPLY of the request count."
                                          (and (string= name "MAXWELL_COMPACT_MODEL")
                                               "env-cheap")))
                         :compact-model)))
+  ;; The thinking effort is remembered with the model, and reaches the client.
+  (let* ((base (scratch-directory "session-effort"))
+         (file (merge-pathnames "session.json" base))
+         (client (maxwell:make-client :model "main" :base-url "https://x.example/v1"
+                                      :effort "high"))
+         (maxwell::*session-file* file))
+    (unwind-protect
+         (progn
+           (check (string= "high"
+                           (maxwell/json:get-key (maxwell::session-record-for-client client)
+                                                 "effort")))
+           (maxwell::remember-client client)
+           (check (string= "high" (getf (maxwell::resolve-client-options
+                                            :environment (constantly nil))
+                                          :effort)))
+           ;; Naming a provider starts a fresh configuration, so the effort of
+           ;; the previous session does not follow it.
+           (check (null (getf (maxwell::resolve-client-options
+                                :base-url "https://y.example/v1"
+                                :environment (constantly nil))
+                              :effort))))
+      (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore)))
   ;; Bad options make MAIN fail with status 1, and IMAGE-MAIN exits with it.
   (let ((*error-output* (make-broadcast-stream)))
     (check (= 1 (maxwell:main '("--color" "bogus"))))

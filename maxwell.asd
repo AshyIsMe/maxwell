@@ -14,6 +14,7 @@
                (:file "src/auth")
                (:file "src/process")
                (:file "src/provider")
+               (:file "src/status")
                (:file "src/session")
                (:file "src/memory")
                (:file "src/compactor")

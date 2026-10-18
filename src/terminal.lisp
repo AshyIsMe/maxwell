@@ -154,13 +154,19 @@ the next prompt instead of being discarded.")
   (max 1 (- (prompt-editor-columns editor)
             (visible-length (prompt-editor-prompt editor)) 2)))
 
+(defun session-client ()
+  "The client of the session's agent, for the status bar, or NIL."
+  (and *agent* (agent-client *agent*)))
+
 (defun editor-redraw (editor)
+  "Draw the status bar and then the prompt line under it."
   (let* ((output (prompt-editor-output editor))
          (text (prompt-editor-text editor))
          (cursor (prompt-editor-cursor editor))
          (width (editor-visible-width editor))
          (start (max 0 (- cursor width)))
          (end (min (length text) (+ start width))))
+    (status-bar-show output (prompt-editor-columns editor) (session-client))
     (format output "~C~C[2K~A~A" #\Return #\Escape (prompt-editor-prompt editor)
             (subseq text start end))
     (when (< cursor end)
@@ -281,6 +287,7 @@ prompts, PgUp opens the transcript, Ctrl-T expands or collapses tool calls,
 and Ctrl-A/E/B/F/U/W/K/Y/L edit the line. IDLE, when given, is called while
 no key arrives, so background work such as compaction continues."
   (declare (ignorable agent))
+  (set-activity :idle)
   (let ((editor (make-prompt-editor agent input output :text *prompt-draft*)))
     (setf *prompt-draft* "")
     (editor-redraw editor)
@@ -312,10 +319,15 @@ no key arrives, so background work such as compaction continues."
   (prompt-editor-text (steering-session-editor session)))
 
 (defun steering-show (session)
-  "Draw the steering prompt if it is not already on screen."
-  (unless (steering-session-shown session)
-    (editor-redraw (steering-session-editor session))
-    (setf (steering-session-shown session) t)))
+  "Draw the steering prompt if it is not already on screen, and keep the status
+bar's text current while it is."
+  (let ((editor (steering-session-editor session)))
+    (if (steering-session-shown session)
+        (status-bar-refresh (prompt-editor-output editor)
+                            (prompt-editor-columns editor) (session-client))
+        (progn
+          (editor-redraw editor)
+          (setf (steering-session-shown session) t)))))
 
 (defun steering-hide (session)
   "Erase the steering prompt so other output starts on a clean line."

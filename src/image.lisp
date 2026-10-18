@@ -168,22 +168,25 @@ keep running. Compaction requests get a few seconds to finish, then the rest
 are cancelled and queued again. A forked child writes the image next to IMAGE
 and the parent renames it into place. Returns IMAGE."
   (unless image (error "This session has no image to save to."))
-  (let ((temporary (checkpoint-temporary-path image)))
-    (when *chat* (compactor-drain *chat* *checkpoint-drain-seconds*))
-    (ensure-directories-exist image)
-    (when (probe-file temporary) (delete-file temporary))
-    (finish-output *standard-output*)
-    (finish-output *error-output*)
-    ;; SBCL forks only with one thread, which Maxwell has by design.
-    (let ((pid (handler-case (sb-posix:fork)
-                 (error (condition)
-                   (save-and-exit-checkpoint temporary image condition)))))
-      (when (zerop pid) (save-checkpoint-child temporary))
-      (unless (and (wait-for-child pid) (probe-file temporary))
-        (ignore-errors (delete-file temporary))
-        (error "Could not save the image to ~A." temporary))
-      (commit-checkpoint temporary (native image))
-      image)))
+  (set-activity :saving)
+  (unwind-protect
+       (let ((temporary (checkpoint-temporary-path image)))
+         (when *chat* (compactor-drain *chat* *checkpoint-drain-seconds*))
+         (ensure-directories-exist image)
+         (when (probe-file temporary) (delete-file temporary))
+         (finish-output *standard-output*)
+         (finish-output *error-output*)
+         ;; SBCL forks only with one thread, which Maxwell has by design.
+         (let ((pid (handler-case (sb-posix:fork)
+                      (error (condition)
+                        (save-and-exit-checkpoint temporary image condition)))))
+           (when (zerop pid) (save-checkpoint-child temporary))
+           (unless (and (wait-for-child pid) (probe-file temporary))
+             (ignore-errors (delete-file temporary))
+             (error "Could not save the image to ~A." temporary))
+           (commit-checkpoint temporary (native image))
+           image))
+    (set-activity :idle)))
 
 ;;; Moving a chat between builds
 

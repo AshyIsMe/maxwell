@@ -13,6 +13,36 @@
   request-fields
   (timeout 300 :type integer))
 
+(defparameter +effort-field+ "_maxwell_effort"
+  "Where a client keeps the thinking effort /effort set, such as \"high\". It is
+provider-private bookkeeping: a request sends the level in the provider's own
+spelling instead, never this field.")
+
+(defun copy-object (object)
+  "A shallow copy of OBJECT, a JSON object, or an empty object when it is not
+one. Nested objects are shared, so copy those too before changing them."
+  (let ((copy (make-hash-table :test #'equal)))
+    (when (hash-table-p object)
+      (maphash (lambda (key value) (setf (gethash key copy) value)) object))
+    copy))
+
+(defun client-effort (client)
+  "The thinking effort CLIENT asks its model for, or NIL for the provider's own
+default."
+  (get-key (client-request-fields client) +effort-field+))
+
+(defun set-client-effort (client level)
+  "Ask CLIENT's model for thinking LEVEL, or the provider's own default when
+LEVEL is NIL. The level travels in the client's request fields, so a copy of the
+client keeps it and no other request field is disturbed."
+  (let ((fields (copy-object (client-request-fields client))))
+    (if (and level (plusp (length level)))
+        (setf (gethash +effort-field+ fields) level)
+        (remhash +effort-field+ fields))
+    (setf (client-request-fields client)
+          (if (zerop (hash-table-count fields)) nil fields))
+    (client-effort client)))
+
 (defun trim-slashes (string)
   (string-right-trim "/" string))
 
@@ -21,6 +51,7 @@
                                     "https://api.openai.com/v1"))
                       (model (or (uiop:getenv "MAXWELL_MODEL") ""))
                       (compact-model (uiop:getenv "MAXWELL_COMPACT_MODEL"))
+                      effort
                       (api-key-environment
                         (or (uiop:getenv "MAXWELL_API_KEY_ENV")
                             "OPENAI_API_KEY"))
@@ -54,18 +85,22 @@
         (setf (gethash "store" fields) nil
               (gethash "stream" fields) t
               request-fields fields)))
-  (%make-client :base-url (trim-slashes base-url)
-                :endpoint endpoint
-                :wire-api (if (eq wire-api :chat) :chat-completions wire-api)
-                :model model
-                :compact-model (and (stringp compact-model)
-                                    (plusp (length compact-model))
-                                    compact-model)
-                :api-key-environment api-key-environment
-                :auth-provider auth-provider
-                :extra-headers extra-headers
-                :request-fields request-fields
-                :timeout timeout)))
+  (let ((client (%make-client
+                  :base-url (trim-slashes base-url)
+                  :endpoint endpoint
+                  :wire-api (if (eq wire-api :chat) :chat-completions wire-api)
+                  :model model
+                  :compact-model (and (stringp compact-model)
+                                      (plusp (length compact-model))
+                                      compact-model)
+                  :api-key-environment api-key-environment
+                  :auth-provider auth-provider
+                  :extra-headers extra-headers
+                  :request-fields request-fields
+                  :timeout timeout)))
+    (when (and (stringp effort) (plusp (length effort)))
+      (set-client-effort client effort))
+    client)))
 
 (defun configure-client-for-openai-oauth (client)
   (let ((fields (copy-object (client-request-fields client))))
@@ -94,12 +129,6 @@
             status detail
             (and (plusp (length stderr)) stderr))))
 
-(defun copy-object (object)
-  (let ((copy (make-hash-table :test #'equal)))
-    (when (hash-table-p object)
-      (maphash (lambda (key value) (setf (gethash key copy) value)) object))
-    copy))
-
 (defun chat-message (message)
   "Copy MESSAGE while removing Maxwell's provider-private bookkeeping keys."
   (let ((copy (make-hash-table :test #'equal)))
@@ -111,13 +140,31 @@
              message)
     copy))
 
+(defun apply-effort (client request)
+  "Send CLIENT's thinking effort in REQUEST's provider spelling: a reasoning
+object on the Responses wire, REASONING_EFFORT on Chat Completions. Other fields
+of a reasoning object the caller sent are kept."
+  (let ((effort (get-key request +effort-field+)))
+    (remhash +effort-field+ request)
+    (when (and effort (plusp (length effort)))
+      (if (eq (client-wire-api client) :responses)
+          (let ((reasoning (get-key request "reasoning")))
+            (if (hash-table-p reasoning)
+                (let ((copy (copy-object reasoning)))
+                  (setf (gethash "effort" copy) effort
+                        (gethash "reasoning" request) copy))
+                (setf (gethash "reasoning" request)
+                      (json-object "effort" effort))))
+          (setf (gethash "reasoning_effort" request) effort)))
+    request))
+
 (defun chat-request-object (client messages tools)
   (let ((request (copy-object (client-request-fields client))))
     ;; Core agent state always wins over optional provider-specific fields.
     (setf (gethash "model" request) (client-model client)
           (gethash "messages" request) (map 'vector #'chat-message messages)
           (gethash "tools" request) tools)
-    request))
+    (apply-effort client request)))
 
 (defun response-tool (tool)
   (let ((function (get-key tool "function")))
@@ -151,7 +198,7 @@
           (gethash "instructions" request) (get-key (first messages) "content")
           (gethash "input" request) (response-input messages)
           (gethash "tools" request) (map 'vector #'response-tool tools))
-    request))
+    (apply-effort client request)))
 
 (defun response-output-text (output)
   (with-output-to-string (stream)

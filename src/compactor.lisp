@@ -34,11 +34,16 @@ function, the response itself or a function that returns it once ready."
   handle)
 
 (defun compaction-client (client)
-  "CLIENT with its compact model selected, or CLIENT itself when it has none."
-  (let ((model (client-compact-model client)))
-    (if (and model (string/= model (client-model client)))
+  "CLIENT with its compact model selected and no thinking effort: summaries are
+mechanical, and a cheap model need not accept the effort parameter. CLIENT itself
+when it already has neither a separate compact model nor an effort."
+  (let* ((model (client-compact-model client))
+         (other-model (and model (string/= model (client-model client))))
+         (effort (client-effort client)))
+    (if (or other-model effort)
         (let ((copy (copy-client client)))
-          (setf (client-model copy) model)
+          (set-client-effort copy nil)
+          (when other-model (setf (client-model copy) model))
           copy)
         client)))
 
