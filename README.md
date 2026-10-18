@@ -25,6 +25,18 @@ export MAXWELL_MODEL=gpt-5
 sbcl --script maxwell.lisp
 ```
 
+Maxwell's workspace is the directory it starts in: the Lisp tool runs there,
+chat lines are tagged with the project that workspace belongs to (its git root,
+or the directory name), and its `AGENTS.md` is read into memory.
+`-C, --workspace DIR` sets it explicitly, so a one-shot run can name the
+project:
+
+```sh
+maxwell --workspace ~/src/thing --print "Explain this project"
+```
+
+`maxwell --help` lists every option and environment variable.
+
 It uses the broadly supported OpenAI chat-completions wire protocol. Point it at
 any compatible service with `MAXWELL_BASE_URL`; if that service reads a
 differently named key, set `MAXWELL_API_KEY_ENV` to the name of its environment
