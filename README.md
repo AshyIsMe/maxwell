@@ -16,7 +16,8 @@ executable image.
 Maxwell has no Lisp library dependencies beyond ASDF/UIOP, which ships with
 SBCL. HTTP requests use `curl` internally; `curl` is not exposed as an agent
 tool. Native ChatGPT OAuth additionally uses `openssl` for PKCE and ID-token
-signature verification.
+signature verification. To skip API-key variables entirely, see
+[Signing in](#signing-in).
 
 ```sh
 export OPENAI_API_KEY=...
@@ -57,44 +58,66 @@ sbcl --script maxwell.lisp \
   --model claude-sonnet-4-6
 ```
 
-If the local Pi configuration already contains the Safe AI Labs provider, the
-included launcher resolves its endpoint, model, and credential without printing
-or copying the key into the command line:
+### Signing in
+
+Maxwell can save a login for two providers, so that no API-key variable or
+launcher script is needed. Sign in once from the shell or the interactive
+prompt; Maxwell verifies the credential, stores it with owner-only permissions,
+and remembers the provider for the next session:
 
 ```sh
-./run.sh
-```
-
-The launcher understands the same `apiKey` forms used by Pi's `models.json`:
-literal values, `$NAME`/`${NAME}` environment references, and leading
-`!command` credential resolvers. Additional Maxwell arguments pass through, for
-example `./run.sh --print "Inspect this project"`.
-
-Use the default `chat` wire API for this provider; the Pi and OMP configurations
-both identify it as `openai-completions`. The configured model has a 1,048,576
-token context window and a 65,536-token maximum output.
-
-To use the existing ChatGPT/Codex OAuth login instead, run:
-
-```sh
-./run-codex.sh
-./run-codex.sh --print "Inspect this project"
-```
-
-Sign in once with Maxwell itself, either from the shell or its interactive
-prompt:
-
-```sh
-./run-codex.sh --login
+maxwell --login safeai     # Safe AI Labs
+maxwell --login openai     # ChatGPT plan
 # or, inside Maxwell:
+/login safeai
 /login openai
 ```
 
-This is the OAuth 2.0 Authorization Code flow with PKCE and OpenID Connect. It
-opens Sign in with ChatGPT, receives the redirect on a temporary loopback
-listener, validates the ID token, and stores refreshable credentials at
-`~/.config/maxwell/openai-auth.json` with owner-only permissions. Override that
-path with `MAXWELL_AUTH_FILE`.
+`--auth PROVIDER` (`-a`) selects a saved login explicitly, for example
+`maxwell --auth openai --print "Inspect this project"`. `--logout PROVIDER` or
+`/logout PROVIDER` forgets it.
+
+| Provider | Credential file (owner-only)         | Override                   |
+|----------|--------------------------------------|----------------------------|
+| `safeai` | `~/.config/maxwell/safeai-auth.json` | `MAXWELL_SAFEAI_AUTH_FILE` |
+| `openai` | `~/.config/maxwell/openai-auth.json` | `MAXWELL_AUTH_FILE`        |
+
+Both live under `$XDG_CONFIG_HOME/maxwell/` when that variable is set.
+Credentials are never written to `session.json` or to saved images.
+
+#### Safe AI Labs
+
+Safe AI Labs does not offer OAuth to third-party clients; its own web sign-in
+issues keys that work only from its Sail CLI. `--login safeai` is therefore a
+browser-assisted API-key login:
+
+1. Maxwell opens <https://safeailabs.ai/keys>, where you sign in and create an
+   API key (it starts with `sail_`). Over SSH, or with
+   `MAXWELL_OAUTH_MODE=manual`, it prints the URL instead of opening a browser.
+2. Paste the key at the prompt. Input is hidden on an interactive terminal.
+3. Maxwell checks the key with `GET /v1/models`, then saves it together with the
+   endpoint and model to use.
+
+A rejected key (`invalid_api_key`) means it was mistyped or revoked. A key that
+Safe AI Labs reports as `sail_key_requires_sail` belongs to the Sail CLI; create
+an API key on the keys page instead.
+
+The provider is OpenAI-compatible Chat Completions at
+`https://us-region.api.safeailabs.ai/v1`. Settings:
+
+- `SAFEAILABS_API_KEY` — when set, used instead of the saved key.
+- `MAXWELL_SAFEAI_BASE_URL` — another endpoint, such as the global
+  `https://gbl.api.safeailabs.ai/v1`.
+- `MAXWELL_SAFEAI_MODEL` — the model; by default the first one the key's
+  `/v1/models` catalog lists at login (for example
+  `deepseek/deepseek-v4.1-flash`, with a 1,048,576-token context window).
+
+#### ChatGPT plan (OpenAI OAuth)
+
+`--login openai` is the OAuth 2.0 Authorization Code flow with PKCE and OpenID
+Connect. It opens Sign in with ChatGPT, receives the redirect on a temporary
+loopback listener, validates the ID token, and stores refreshable credentials.
+Maxwell refreshes the saved token itself.
 
 When Maxwell detects SSH, login automatically switches to manual callback
 mode. Open the printed URL on your local computer. After approval, the browser
@@ -108,18 +131,22 @@ OpenAI's stricter documented workflow for a self-hosted VM is to complete login
 locally and transfer the protected credential file over SSH. The paste flow is
 a convenient SSH fallback that retains PKCE and state validation.
 
-`run-codex.sh` is now only a provider preset. Maxwell refreshes the saved token
-itself and uses the streaming Responses API with `store: false`; it does not
-depend on Pi. The default model is `gpt-5.6-sol`; override it with
-`MAXWELL_CODEX_MODEL`. Provider-specific fields remain available, for example:
+`--auth openai` alone configures the whole provider: the streaming Responses API
+with `store: false`. The default model is `gpt-5.6-sol`; override it with
+`--model` or `MAXWELL_CODEX_MODEL`. Provider-specific fields remain available,
+for example:
 
 ```sh
-./run-codex.sh --request-json '{"reasoning":{"effort":"high"}}'
+maxwell --auth openai --request-json '{"reasoning":{"effort":"high"}}'
 ```
 
 For security, OAuth mode always forces the public OpenAI endpoint, the
 Responses wire API, `store: false`, and `stream: true`, regardless of request
 overrides.
+
+API keys and OAuth tokens reach `curl` through a short-lived owner-only header
+file rather than its command line, so other local users cannot read them with
+`ps`.
 
 Inside Maxwell, `/model` fetches the current account/provider catalog and shows
 the selected model. Use `/model MODEL` to switch, for example:
@@ -135,27 +162,29 @@ Maxwell remembers the provider configuration and model it last used, so a bare
 invocation continues with the same service and model:
 
 ```sh
-./run.sh --print "Inspect this project"   # Safe AI Labs provider
+maxwell --login safeai                    # Safe AI Labs
 maxwell                                   # the same provider and model
-./run-codex.sh --login                    # ChatGPT-plan provider
-maxwell                                   # ChatGPT plan, Codex model
+maxwell --auth openai --print "Inspect"   # ChatGPT plan, Codex model
+maxwell                                   # ChatGPT plan again
 ```
 
 The record lives at `~/.config/maxwell/session.json` (override it with
 `MAXWELL_SESSION_FILE`). Maxwell writes it whenever a session starts, when
-`/model MODEL` selects a model, and after `/login openai`. It holds the base
-URL, endpoint, wire API, credential variable name, OAuth provider, extra
-headers, and model.
+`/model MODEL` selects a model, and after `/login`. It holds the base URL,
+endpoint, wire API, credential variable name, login provider, extra headers,
+and model.
 
 Command-line options and `MAXWELL_*` environment variables always win. Naming a
 provider explicitly—`--base-url`, `--endpoint`, `--wire-api`, `--api-key-env`,
 `--auth`, `--header`, or the matching environment variable—starts a fresh
 configuration instead of reusing the remembered one, so `--model` alone keeps
-the remembered provider while `--base-url` replaces it. Credentials are never
-copied into the record: they still come from the environment variable the
-provider names, or from the saved OAuth login. Delete `session.json` to forget
-the last session; if it cannot be written, Maxwell simply starts without a
-remembered default.
+the remembered provider while `--base-url` replaces it. A provider's own
+variables (`MAXWELL_CODEX_MODEL`, `MAXWELL_SAFEAI_MODEL`,
+`MAXWELL_SAFEAI_BASE_URL`) outrank the generic ones for that provider.
+Credentials are never copied into the record: they still come from the
+environment variable the provider names, or from the saved login. Delete
+`session.json` to forget the last session; if it cannot be written, Maxwell
+simply starts without a remembered default.
 
 Responses requests with `"stream":true` are read as server-sent events.
 Maxwell waits for `response.completed`, then feeds that complete response into
@@ -203,7 +232,8 @@ The agent itself can schedule the same operation by evaluating:
 
 The save happens only after the model finishes its current run, avoiding a
 half-recorded tool call. The configured API key is read from its environment
-variable for each request and is not stored in the image. Custom header values
+variable, or the saved login from its credential file, for each request and is
+not stored in the image. Custom header values
 *are* part of client state, so do not put secrets in `--header` if you intend to
 save an image.
 

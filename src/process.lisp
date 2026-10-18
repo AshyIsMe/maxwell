@@ -25,26 +25,59 @@ interactive prompt can erase its input line before other output appears.")
     (write-string text stream))
   path)
 
+(defun write-private-file (path text)
+  "Create PATH readable only by its owner and write TEXT to it. The file is
+restricted before any of TEXT reaches it."
+  (with-open-file (stream path :direction :output :if-exists :error
+                               :if-does-not-exist :create
+                               :external-format :utf-8)
+    (protect-file path)
+    (write-string text stream))
+  path)
+
+(defun private-temporary-path (kind)
+  "A fresh, unpredictable temporary pathname for a private file of KIND."
+  (pathname (format nil "~Amaxwell-~A-~A" (uiop:temporary-directory) kind
+                    (random-value 12))))
+
+(defun write-private-files (files)
+  "Write each (PATH . TEXT) in FILES owner-only. If one fails, those already
+written are deleted before the error propagates."
+  (handler-bind ((error (lambda (condition)
+                          (declare (ignore condition))
+                          (delete-private-files files))))
+    (loop for (path . text) in files do (write-private-file path text))))
+
+(defun delete-private-files (files)
+  (loop for (path) in files
+        when (probe-file path) do (delete-file path)))
+
 (defstruct (command-job (:constructor %make-command-job))
   "A child process started by START-COMMAND, with the temporary files that
 hold its input and output. It lives only in the running process."
   process
   input-path
   output-path
-  error-path)
+  error-path
+  ;; (PATH . TEXT) files, such as a credential header, that exist only while
+  ;; the command runs.
+  (private-files '()))
 
-(defun start-command (arguments &key input)
+(defun start-command (arguments &key input private-files)
   "Start ARGUMENTS with INPUT on standard input and return a COMMAND-JOB at
-once, without waiting for the command to finish."
+once, without waiting for the command to finish. PRIVATE-FILES are (PATH . TEXT)
+pairs written owner-only before the command starts and deleted with the job."
   (let* ((stem (format nil "~Amaxwell-command-~A"
                        (uiop:temporary-directory) (random-value 8)))
          (job (%make-command-job
                 :input-path (pathname (concatenate 'string stem ".in"))
                 :output-path (pathname (concatenate 'string stem ".out"))
-                :error-path (pathname (concatenate 'string stem ".err")))))
+                :error-path (pathname (concatenate 'string stem ".err"))
+                :private-files private-files)))
     (handler-bind ((error (lambda (condition)
                             (declare (ignore condition))
                             (delete-command-files job))))
+      (write-private-files private-files)
       (write-encoded-file (command-job-input-path job) (or input ""))
       (setf (command-job-process job)
             (sb-ext:run-program (first arguments) (rest arguments)
@@ -65,7 +98,8 @@ once, without waiting for the command to finish."
   (dolist (path (list (command-job-input-path job)
                       (command-job-output-path job)
                       (command-job-error-path job)))
-    (when (and path (probe-file path)) (delete-file path))))
+    (when (and path (probe-file path)) (delete-file path)))
+  (delete-private-files (command-job-private-files job)))
 
 (defun finish-command (job)
   "Wait for JOB to exit, delete its files, and return its output, its error
@@ -92,10 +126,11 @@ output, and its exit status."
   (delete-command-files job)
   nil)
 
-(defun run-command-asynchronously (arguments input)
+(defun run-command-asynchronously (arguments input private-files)
   "Run ARGUMENTS with INPUT on standard input, servicing keystrokes meanwhile."
   (unwind-protect
-       (let ((job (start-command arguments :input input))
+       (let ((job (start-command arguments :input input
+                                           :private-files private-files))
              (finished nil))
          (unwind-protect
               (progn
@@ -108,14 +143,19 @@ output, and its exit status."
     ;; The input line must go away before the caller prints anything else.
     (when *input-hide* (funcall *input-hide*))))
 
-(defun run-command (arguments &key input)
+(defun run-command (arguments &key input private-files)
   "Run ARGUMENTS with INPUT on its standard input. Returns the command's
-output, its error output, and its exit status."
+output, its error output, and its exit status. PRIVATE-FILES are (PATH . TEXT)
+pairs that exist, owner-only, only while the command runs."
   (if (null *input-poll*)
-      (multiple-value-bind (output error-output status)
-          (uiop:run-program arguments
-                            :input (make-string-input-stream (or input ""))
-                            :output :string :error-output :string
-                            :ignore-error-status t)
-        (values output error-output status))
-      (run-command-asynchronously arguments input)))
+      (unwind-protect
+           (progn
+             (write-private-files private-files)
+             (multiple-value-bind (output error-output status)
+                 (uiop:run-program arguments
+                                   :input (make-string-input-stream (or input ""))
+                                   :output :string :error-output :string
+                                   :ignore-error-status t)
+               (values output error-output status)))
+        (delete-private-files private-files))
+      (run-command-asynchronously arguments input private-files)))
