@@ -20,8 +20,11 @@ Usage: maxwell [options] [prompt ...]
 
 Environment: OPENAI_API_KEY, MAXWELL_MODEL, MAXWELL_BASE_URL,
              MAXWELL_ENDPOINT, MAXWELL_WIRE_API, MAXWELL_API_KEY_ENV,
-             MAXWELL_AUTH_FILE, MAXWELL_CODEX_MODEL.
+             MAXWELL_AUTH_FILE, MAXWELL_SESSION_FILE, MAXWELL_CODEX_MODEL.
              MAXWELL_OAUTH_MODE (auto, manual, or loopback).
+
+Without a provider option, Maxwell reuses the provider and model of the
+previous session, remembered in ~/.config/maxwell/session.json.
 " stream))
 
 (defun take-option (arguments option)
@@ -77,6 +80,55 @@ Environment: OPENAI_API_KEY, MAXWELL_MODEL, MAXWELL_BASE_URL,
              (string= line prefix :end1 (length prefix) :end2 (length prefix)))
     (string-trim '(#\Space #\Tab) (subseq line (length prefix)))))
 
+(defun provider-options-given-p (base-url endpoint wire-api api-key-env auth-provider
+                                 headers lookup)
+  "True when a provider was named explicitly, on the command line or in the
+environment. Naming a provider starts a fresh configuration instead of reusing
+the remembered session."
+  (or base-url endpoint wire-api api-key-env auth-provider headers
+      (funcall lookup "MAXWELL_BASE_URL")
+      (funcall lookup "MAXWELL_ENDPOINT")
+      (funcall lookup "MAXWELL_WIRE_API")
+      (funcall lookup "MAXWELL_API_KEY_ENV")))
+
+(defun resolve-client-options (&key model base-url endpoint wire-api api-key-env
+                                    auth-provider headers
+                                    (environment #'environment-value))
+  "Merge the command line, the environment, and the previous session's provider
+and model into MAKE-CLIENT arguments. Explicit settings always win; the
+remembered session is used only when the caller named no provider at all.
+ENVIRONMENT names the lookup for MAXWELL_* variables, which tests replace."
+  (flet ((lookup (name) (funcall environment name)))
+    (let ((remembered
+            (unless (provider-options-given-p base-url endpoint wire-api api-key-env
+                                              auth-provider headers #'lookup)
+              (remembered-client-options (load-session-record)))))
+      (list :model (or model (lookup "MAXWELL_MODEL") (getf remembered :model) "")
+            :base-url (or base-url (lookup "MAXWELL_BASE_URL")
+                          (getf remembered :base-url) "https://api.openai.com/v1")
+            :endpoint (or endpoint (lookup "MAXWELL_ENDPOINT")
+                          (getf remembered :endpoint))
+            :wire-api (or wire-api (lookup "MAXWELL_WIRE_API")
+                          (getf remembered :wire-api) :chat-completions)
+            :api-key-environment (or api-key-env (lookup "MAXWELL_API_KEY_ENV")
+                                     (getf remembered :api-key-environment)
+                                     "OPENAI_API_KEY")
+            :auth-provider (cond
+                             ((null auth-provider) (getf remembered :auth-provider))
+                             ((string-equal auth-provider "openai") :openai)
+                             (t (error "Unknown auth provider ~S; supported provider: openai."
+                                       auth-provider)))
+            :extra-headers (or headers (getf remembered :extra-headers))))))
+
+(defun adopt-openai-client (client)
+  "Point CLIENT at the ChatGPT-plan Responses endpoint with a Codex model, and
+remember it as the provider of this session."
+  (configure-client-for-openai-oauth client)
+  (setf (client-model client)
+        (or (environment-value "MAXWELL_CODEX_MODEL") "gpt-5.6-sol"))
+  (remember-client client)
+  client)
+
 (defun print-model-catalog (agent)
   (let* ((client (agent-client agent))
          (models (list-provider-models client)))
@@ -94,34 +146,45 @@ Environment: OPENAI_API_KEY, MAXWELL_MODEL, MAXWELL_BASE_URL,
     (unless (find model-id models :key #'car :test #'string=)
       (error "Model ~S is not available from the current provider." model-id))
     (setf (client-model (agent-client agent)) model-id)
+    (remember-client (agent-client agent))
     (format t "Selected model: ~A~%" model-id)))
+
+(defun run-interactive-turn (line agent)
+  "Run LINE, keeping the prompt live while the model works so that the user can
+browse the transcript and queue steering prompts."
+  (let ((state (interactive-terminal-state)))
+    (if (null state)
+        (run line :agent agent)
+        (unwind-protect
+             (progn
+               (terminal-command "-icanon" "-echo" "min" "1" "time" "0")
+               (let* ((session (make-steering-session agent *standard-input*
+                                                      *standard-output*))
+                      (*input-poll* (lambda () (service-steering-input session)))
+                      (*input-hide* (lambda () (steering-hide session))))
+                 (unwind-protect (run line :agent agent)
+                   (steering-hide session)
+                   ;; An unfinished steering line becomes the next prompt.
+                   (setf *prompt-draft* (steering-draft session)))))
+          (terminal-command state)))))
 
 (defun interactive-loop (&optional (agent *agent*))
   (setf *agent* (or agent (make-agent)))
-  (format t "~&Maxwell ~A — ~A~%Type /help for commands.~%"
+  (format t "~&Maxwell ~A — ~A~%Type /help for commands; PgUp/PgDn browse the transcript, Up/Down recall previous prompts.~%"
           (client-model (agent-client *agent*))
           (namestring (agent-workspace *agent*)))
   (loop
-    (format t "~&maxwell> ")
-    (finish-output)
-    (let ((line (read-line *standard-input* nil nil)))
+    (let ((line (read-interactive-prompt *agent*)))
       (unless line (return 0))
       (cond
         ((or (command-p line "/quit") (command-p line "/exit")) (return 0))
         ((command-p line "/help")
-         (format t "/login openai  sign in with ChatGPT OAuth~%/model         list current provider's available models~%/model MODEL   select an available model~%/save PATH      save a resumable executable image and exit~%/history        show message count~%/quit           exit~%"))
+         (format t "/login openai  sign in with ChatGPT OAuth~%/model         list current provider's available models~%/model MODEL   select an available model~%/save PATH      save a resumable executable image and exit~%/history        show message count~%/quit           exit~%Editing: Up/Down history; Ctrl-A/E line ends; Ctrl-U/W/K kill; Ctrl-Y yank.~%While the model works: PgUp/PgDn browse the transcript; type a line and~%press Enter to steer the model before its next request.~%"))
         ((command-p line "/login openai")
          (handler-case
              (progn
                (openai-login)
-               (let ((client (agent-client *agent*)))
-                 (configure-client-for-openai-oauth client)
-                 (unless (and (string= (client-model client)
-                                       (or (uiop:getenv "MAXWELL_CODEX_MODEL") ""))
-                              (plusp (length (client-model client))))
-                   (setf (client-model client)
-                         (or (uiop:getenv "MAXWELL_CODEX_MODEL")
-                             "gpt-5.6-sol"))))
+               (adopt-openai-client (agent-client *agent*))
                (format t "The current Maxwell session now uses OpenAI OAuth.~%"))
            (error (condition)
              (format *error-output* "Login failed: ~A~%" condition))))
@@ -143,7 +206,7 @@ Environment: OPENAI_API_KEY, MAXWELL_MODEL, MAXWELL_BASE_URL,
                (save-image (namestring (workspace-path path))))))
         ((zerop (length (string-trim '(#\Space #\Tab) line))))
         (t
-         (handler-case (run line :agent *agent*)
+         (handler-case (run-interactive-turn line *agent*)
            (error (condition) (format *error-output* "Error: ~A~%" condition))))))))
 
 (defun image-main ()
@@ -163,6 +226,7 @@ Environment: OPENAI_API_KEY, MAXWELL_MODEL, MAXWELL_BASE_URL,
             (error "Unknown login provider ~S; supported provider: openai."
                    login-provider))
           (openai-login)
+          (adopt-openai-client (make-client :auth-provider :openai :model ""))
           (return-from main 0))
         (let ((request-fields
                 (and request-json
@@ -171,26 +235,20 @@ Environment: OPENAI_API_KEY, MAXWELL_MODEL, MAXWELL_BASE_URL,
                          (error "Invalid --request-json: ~A" condition))))))
           (when (and request-fields (not (hash-table-p request-fields)))
             (error "--request-json must be a JSON object."))
-        (let* ((client (make-client
-                         :model (or model (uiop:getenv "MAXWELL_MODEL") "")
-                         :base-url (or base-url (uiop:getenv "MAXWELL_BASE_URL")
-                                       "https://api.openai.com/v1")
-                         :endpoint (or endpoint (uiop:getenv "MAXWELL_ENDPOINT"))
-                         :wire-api (or wire-api (uiop:getenv "MAXWELL_WIRE_API")
-                                       :chat-completions)
-                         :api-key-environment
-                         (or api-key-env (uiop:getenv "MAXWELL_API_KEY_ENV")
-                             "OPENAI_API_KEY")
-                         :auth-provider
-                         (cond
-                           ((null auth-provider) nil)
-                           ((string-equal auth-provider "openai") :openai)
-                           (t (error "Unknown auth provider ~S; supported provider: openai."
-                                     auth-provider)))
-                         :extra-headers headers
-                         :request-fields request-fields))
+        (let* ((client (apply #'make-client
+                              (append
+                                (resolve-client-options
+                                  :model model
+                                  :base-url base-url
+                                  :endpoint endpoint
+                                  :wire-api wire-api
+                                  :api-key-env api-key-env
+                                  :auth-provider auth-provider
+                                  :headers headers)
+                                (list :request-fields request-fields))))
                (agent (make-agent :client client
                                   :workspace (or workspace (uiop:getcwd)))))
+          (remember-client client)
           (setf *agent* agent)
           (if prompt
               (progn (run prompt :agent agent) 0)

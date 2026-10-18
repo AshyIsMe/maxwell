@@ -129,6 +129,34 @@ the selected model. Use `/model MODEL` to switch, for example:
 /model gpt-6.1-sol
 ```
 
+### Remembering the last provider and model
+
+Maxwell remembers the provider configuration and model it last used, so a bare
+invocation continues with the same service and model:
+
+```sh
+./run.sh --print "Inspect this project"   # Safe AI Labs provider
+maxwell                                   # the same provider and model
+./run-codex.sh --login                    # ChatGPT-plan provider
+maxwell                                   # ChatGPT plan, Codex model
+```
+
+The record lives at `~/.config/maxwell/session.json` (override it with
+`MAXWELL_SESSION_FILE`). Maxwell writes it whenever a session starts, when
+`/model MODEL` selects a model, and after `/login openai`. It holds the base
+URL, endpoint, wire API, credential variable name, OAuth provider, extra
+headers, and model.
+
+Command-line options and `MAXWELL_*` environment variables always win. Naming a
+provider explicitly—`--base-url`, `--endpoint`, `--wire-api`, `--api-key-env`,
+`--auth`, `--header`, or the matching environment variable—starts a fresh
+configuration instead of reusing the remembered one, so `--model` alone keeps
+the remembered provider while `--base-url` replaces it. Credentials are never
+copied into the record: they still come from the environment variable the
+provider names, or from the saved OAuth login. Delete `session.json` to forget
+the last session; if it cannot be written, Maxwell simply starts without a
+remembered default.
+
 Responses requests with `"stream":true` are read as server-sent events.
 Maxwell waits for `response.completed`, then feeds that complete response into
 the same tool loop used for non-streaming responses. Failed, incomplete, or
@@ -152,6 +180,11 @@ make test
 make build
 ./maxwell --model gpt-5
 ```
+
+Terminal behaviour is covered by two pty tests that drive the built executable:
+`python3 tests/terminal-pty.py` for editing, history, and settings restoration,
+and `python3 tests/terminal-pty-steering.py` for browsing and steering during a
+request (it serves a deliberately slow fake provider on a local port).
 
 ## Images
 
@@ -186,3 +219,42 @@ save an image.
 
 These constraints are the design. The code is small enough for Maxwell to
 inspect and adapt itself using its own Lisp tool.
+
+### Transcript navigation
+
+At the interactive prompt, press **Page Up** to open conversation history,
+including tool calls and results. **Page Up / Page Down** move one page at a
+time; **Escape** returns to the prompt. Page Down past the newest page also
+returns. Your unfinished input is preserved. Left/Right, Home/End, Backspace,
+and Delete edit the prompt; long input scrolls horizontally.
+
+This uses an ANSI-compatible terminal and `stty` with `/dev/tty` (currently
+Linux). Redirected input/output and `TERM=dumb` retain ordinary line input.
+The viewer shows conversation messages, not every CLI status line, and terminal
+dimensions are read when it opens.
+
+### Steering the model while it works
+
+While a request is in flight the prompt stays live. A `steer> ` line marks where
+you can type; pressing Enter sends that text to the model before its next
+request, so you can redirect work already under way:
+
+```text
+maxwell> Refactor the parser.
+[common-lisp] ...
+steer> actually, keep the old API
+```
+
+The model finishes the answer it was writing, then reads your prompt and
+continues in the same turn. **Page Up / Page Down** open the transcript viewer
+during a request too, and a half-typed steering line is carried into the next
+prompt instead of being discarded.
+
+Steering applies while Maxwell waits for the provider and between tool calls. A
+single long tool call runs with the Lisp world locked, so keys pressed during it
+are handled as soon as it finishes — they wait in the terminal buffer and are
+not lost.
+
+This is done by running `curl` asynchronously and polling the terminal while it
+runs, rather than by evaluating tool calls on a second thread. Tool calls keep
+running on the one thread that owns the agent's Lisp world.

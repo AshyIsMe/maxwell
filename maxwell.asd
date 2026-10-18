@@ -9,8 +9,11 @@
                (:file "src/json")
                (:file "src/runtime")
                (:file "src/auth")
+               (:file "src/process")
                (:file "src/provider")
+               (:file "src/session")
                (:file "src/agent")
+               (:file "src/terminal")
                (:file "src/cli"))
   :build-operation "program-op"
   :build-pathname "maxwell"

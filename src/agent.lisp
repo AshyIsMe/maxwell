@@ -87,25 +87,57 @@
       (setf *pending-image* nil)
       (save-image path))))
 
-(defun run (prompt &key (agent (or *agent* (make-agent))) (print-response t))
-  "Run one user PROMPT through AGENT until the model stops calling Lisp."
-  (setf *agent* agent)
-  (setf (agent-history agent)
-        (append (agent-history agent)
-                (list (json-object "role" "user" "content" prompt))))
-  (loop
-    (let* ((response (invoke-model agent))
-           (message (assistant-message response))
-           (tool-calls (get-key message "tool_calls")))
+(defvar *steering* '()
+  "Prompts typed while a turn is running, oldest first. They reach the model
+before its next request, so the user can redirect work already in progress.")
+
+(defun queue-steering (text)
+  "Record TEXT as a steering prompt for the model's next request."
+  (when (plusp (length (string-trim '(#\Space #\Tab) text)))
+    (setf *steering* (append *steering* (list text))))
+  text)
+
+(defun steering-pending-p ()
+  "True when a steering prompt is waiting to be delivered."
+  (not (null *steering*)))
+
+(defun inject-steering (agent)
+  "Append queued steering prompts to AGENT's history as user messages."
+  (let ((pending *steering*))
+    (setf *steering* '())
+    (when pending
       (setf (agent-history agent)
-            (append (agent-history agent) (list message)))
-      (if (and (vectorp tool-calls) (plusp (length tool-calls)))
-          (loop for call across tool-calls
-                do (setf (agent-history agent)
-                         (append (agent-history agent)
-                                 (list (execute-tool-call agent call)))))
-          (let ((content (message-content message)))
-            (when (and print-response (plusp (length content)))
-              (format t "~&~A~%" content))
-            (finish-pending-image)
-            (return content))))))
+            (append (agent-history agent)
+                    (mapcar (lambda (text)
+                              (json-object "role" "user" "content" text))
+                            pending))))
+    pending))
+
+(defun run (prompt &key (agent (or *agent* (make-agent))) (print-response t))
+  "Run one user PROMPT through AGENT until the model stops calling Lisp.
+Prompts typed while the model works are delivered before its next request."
+  ;; Nested runs (including tests invoked by a tool) must restore the caller.
+  (let ((*agent* agent)
+        (*steering* '()))
+    (setf (agent-history agent)
+          (append (agent-history agent)
+                  (list (json-object "role" "user" "content" prompt))))
+    (loop
+      (inject-steering agent)
+      (let* ((response (invoke-model agent))
+             (message (assistant-message response))
+             (tool-calls (get-key message "tool_calls")))
+        (setf (agent-history agent)
+              (append (agent-history agent) (list message)))
+        (if (and (vectorp tool-calls) (plusp (length tool-calls)))
+            (loop for call across tool-calls
+                  do (setf (agent-history agent)
+                           (append (agent-history agent)
+                                   (list (execute-tool-call agent call)))))
+            (let ((content (message-content message)))
+              (when (and print-response (plusp (length content)))
+                (format t "~&~A~%" content))
+              ;; A prompt typed while the model was answering continues the turn.
+              (unless (steering-pending-p)
+                (finish-pending-image)
+                (return content))))))))

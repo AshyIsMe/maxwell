@@ -2,3 +2,9 @@
 /.cache/
 *.fasl
 *.image
+
+# Local environment files
+.env
+.env.*
+!.env.example
+!.env.sample

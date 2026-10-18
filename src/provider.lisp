@@ -326,8 +326,7 @@
                          append (list "--header" header))
                    (list "--write-out" (format nil "~%%{http_code}") url))))
     (multiple-value-bind (output error-output status)
-        (uiop:run-program arguments :output :string :error-output :string
-                                    :ignore-error-status t)
+        (run-command arguments)
       (let* ((newline (position #\Newline output :from-end t))
              (response-body (if newline (subseq output 0 newline) output))
              (http-status (if newline (subseq output (1+ newline)) "000")))
@@ -363,32 +362,30 @@
                    (list "--data-binary" "@-"
                          "--write-out" (format nil "~%%{http_code}")
                          url))))
-    (with-input-from-string (input body)
-      (multiple-value-bind (output error-output status)
-          (uiop:run-program arguments
-                            :input input
-                            :output :string
-                            :error-output :string
-                            :ignore-error-status t)
-        (let* ((newline (position #\Newline output :from-end t))
-               (response-body (if newline (subseq output 0 newline) output))
-               (http-status (if newline (subseq output (1+ newline)) "000")))
-          (unless (and (zerop status)
-                       (= (length http-status) 3)
-                       (char= (char http-status 0) #\2))
+    ;; The request body goes to the child's standard input. At the prompt the
+    ;; child runs asynchronously so the user can still browse the transcript
+    ;; and queue steering prompts while the model works.
+    (multiple-value-bind (output error-output status)
+        (run-command arguments :input body)
+      (let* ((newline (position #\Newline output :from-end t))
+             (response-body (if newline (subseq output 0 newline) output))
+             (http-status (if newline (subseq output (1+ newline)) "000")))
+        (unless (and (zerop status)
+                     (= (length http-status) 3)
+                     (char= (char http-status 0) #\2))
+          (error 'provider-error
+                 :message (response-error-message response-body
+                                                  (if (zerop status) http-status status)
+                                                  error-output)))
+        (handler-case (if streaming
+                          (decode-responses-sse response-body)
+                          (decode response-body))
+          (error (condition)
+            (when (typep condition 'provider-error) (error condition))
             (error 'provider-error
-                   :message (response-error-message response-body
-                                                    (if (zerop status) http-status status)
-                                                    error-output)))
-          (handler-case (if streaming
-                            (decode-responses-sse response-body)
-                            (decode response-body))
-            (error (condition)
-              (when (typep condition 'provider-error) (error condition))
-              (error 'provider-error
-                     :message (format nil "Provider returned invalid ~A: ~A~%~A"
-                                      (if streaming "SSE" "JSON")
-                                      condition response-body)))))))))
+                   :message (format nil "Provider returned invalid ~A: ~A~%~A"
+                                    (if streaming "SSE" "JSON")
+                                    condition response-body))))))))
 
 (defun call-provider (client messages tools)
   (when (zerop (length (client-model client)))

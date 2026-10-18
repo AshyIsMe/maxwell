@@ -14,15 +14,25 @@
 (defparameter +openai-scope+
   "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct")
 
+(defun environment-value (name)
+  "The value of environment variable NAME, or NIL when it is unset or empty."
+  (let ((value (uiop:getenv name)))
+    (and value (plusp (length value)) value)))
+
+(defun environment-pathname (name)
+  "The pathname held by environment variable NAME, or NIL."
+  (let ((value (environment-value name)))
+    (and value (pathname value))))
+
+(defun config-directory ()
+  "Maxwell's per-user configuration directory."
+  (uiop:ensure-directory-pathname
+    (or (environment-pathname "XDG_CONFIG_HOME")
+        (merge-pathnames ".config/" (user-homedir-pathname)))))
+
 (defun auth-file-path ()
-  (or (let ((override (uiop:getenv "MAXWELL_AUTH_FILE")))
-        (and override (plusp (length override)) (pathname override)))
-      (merge-pathnames
-        "maxwell/openai-auth.json"
-        (uiop:ensure-directory-pathname
-          (or (let ((xdg (uiop:getenv "XDG_CONFIG_HOME")))
-                (and xdg (plusp (length xdg)) (pathname xdg)))
-              (merge-pathnames ".config/" (user-homedir-pathname)))))))
+  (or (environment-pathname "MAXWELL_AUTH_FILE")
+      (merge-pathnames "maxwell/openai-auth.json" (config-directory))))
 
 (defun random-octets (count)
   (let ((bytes (make-array count :element-type '(unsigned-byte 8))))
@@ -178,11 +188,12 @@
   (uiop:run-program (list "chmod" "600" (namestring path))
                     :output nil :error-output nil))
 
-(defun save-auth-record (record &optional (path (auth-file-path)))
+(defun write-private-json-file (record path)
+  "Atomically write RECORD to PATH as JSON readable only by its owner."
   (ensure-directories-exist path)
   (let ((temporary
           (make-pathname :name (format nil ".~A.tmp-~A"
-                                      (or (pathname-name path) "auth")
+                                      (or (pathname-name path) "maxwell")
                                       (random-value 8))
                          :type (pathname-type path)
                          :defaults path)))
@@ -198,6 +209,9 @@
            (protect-file path))
       (when (probe-file temporary) (delete-file temporary))))
   record)
+
+(defun save-auth-record (record &optional (path (auth-file-path)))
+  (write-private-json-file record path))
 
 (defun ensure-host-record ()
   (let ((record (or (load-auth-record) (json-object))))
