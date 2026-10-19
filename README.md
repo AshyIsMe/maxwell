@@ -11,6 +11,32 @@ other Lisp state survive from one call to the next. The conversation is one
 chat that never ends, across every project, and it lives with that Lisp state
 in a single executable SBCL image that Maxwell checkpoints itself into.
 
+## Install
+
+Maxwell builds to a single self-contained executable, so installing it is a copy:
+
+```sh
+make build      # compiles everything into ./maxwell
+make install    # copies it to ~/.local/bin
+```
+
+`make install` honours `PREFIX` (default `$(HOME)/.local`), `BINDIR` (default
+`$(PREFIX)/bin`), and `DESTDIR` for staged packaging:
+
+```sh
+make install PREFIX=/usr/local
+```
+
+`make uninstall` removes it. The executable embeds an SBCL core, Maxwell
+itself, and its two vendored libraries, so there is nothing else to install and
+no Quicklisp, Roswell, or system package is needed.
+
+You can also run a checkout directly, without building a binary:
+
+```sh
+sbcl --script maxwell.lisp
+```
+
 ## Run it
 
 Maxwell needs only SBCL: ASDF/UIOP ship with it, and its two Lisp libraries,
