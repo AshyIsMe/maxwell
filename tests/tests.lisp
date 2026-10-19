@@ -16,6 +16,20 @@
     (check (nth-value 1 (gethash "additionalProperties" decoded)))
     (check (not (nth-value 1 (gethash "additionalproperties" decoded))))))
 
+(defun test-vendored-libraries ()
+  ;; The pinned copies under vendor/ are the ones loaded, whatever else the
+  ;; machine has installed.
+  (dolist (name '("alexandria" "fset" "misc-extensions" "named-readtables"))
+    (let ((system (asdf:find-system name)))
+      (check (search "/vendor/" (namestring (asdf:system-source-directory system))))))
+  (check (string= "2.5.0" (asdf:component-version (asdf:find-system "fset"))))
+  ;; Agent-authored Lisp reaches both libraries through their nicknames, and
+  ;; FSet does not shadow CL's own sequence functions there.
+  (check (string= "2" (maxwell:eval-lisp "(values (f:lookup (f:with (f:empty-map) :b 2) :b))")))
+  (check (string= "(1 2)" (maxwell:eval-lisp "(a:ensure-list '(1 2))")))
+  (check (string= "3" (maxwell:eval-lisp "(find 3 '(1 2 3))")))
+  (check (eq (find-symbol "FIND" "MAXWELL/WORKSPACE") 'cl:find)))
+
 (defun test-eval ()
   (check (string= "3" (maxwell:eval-lisp "(+ 1 2)")))
   (check (search "hello" (maxwell:eval-lisp "(format t \"hello\") 9")))
@@ -731,6 +745,7 @@
     (test-json)
     (test-json-key-case)
     (test-eval)
+    (test-vendored-libraries)
     (test-agent-loop)
     (test-nested-agent-run)
     (test-responses-adapter)

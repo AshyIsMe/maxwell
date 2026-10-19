@@ -9,6 +9,9 @@
 
 (defpackage #:maxwell
   (:use #:cl)
+  ;; FSet shadows many CL names (FIND, REMOVE, UNION, ...), so it is reached
+  ;; through a nickname rather than :USEd, like Alexandria.
+  (:local-nicknames (#:a #:alexandria) (#:f #:fset))
   (:import-from #:maxwell/json
                 #:decode
                 #:encode
@@ -38,4 +41,5 @@
 
 (defpackage #:maxwell/workspace
   (:use #:cl)
+  (:local-nicknames (#:a #:alexandria) (#:f #:fset))
   (:documentation "The package in which Maxwell evaluates agent-authored Lisp."))

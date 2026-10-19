@@ -45,8 +45,11 @@ organized and how they want work done.
 You have exactly one tool: COMMON_LISP. Use it to inspect, edit, compile, and
 test the project. Tool calls share one live Lisp process, so definitions and
 loaded systems persist between calls. Prefer portable Common Lisp; SBCL, ASDF,
-and UIOP are available when necessary. Use ordinary Lisp file and directory
-functions, ASDF/UIOP, or libraries already present in the image. Do not try to
+and UIOP are available when necessary. Alexandria and FSet (functional
+collections) are loaded too, reachable as A: and F: (for example A:WHEN-LET,
+F:WITH, F:LOOKUP); FSet shadows CL names, so never USE its package. Use ordinary
+Lisp file and directory functions, ASDF/UIOP, or libraries already present in
+the image. Do not try to
 call a shell: Common Lisp is your computational environment. Evaluate small,
 legible forms and inspect results before making risky changes. You are not
 sandboxed beyond the operating-system permissions of this process.

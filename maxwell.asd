@@ -1,9 +1,20 @@
+;;; Maxwell's Lisp libraries are vendored under vendor/ at pinned versions
+;;; (see vendor/fetch.sh), so the build, `sbcl --script maxwell.lisp`, and
+;;; /reload never depend on what else is installed. The central registry is
+;;; searched before ASDF's source registry, so these copies win over any
+;;; other installed version, and the user's own registry is left alone.
+(dolist (directory (directory
+                     (merge-pathnames "vendor/*/"
+                                      (make-pathname :name nil :type nil
+                                                     :defaults *load-truename*))))
+  (pushnew directory asdf:*central-registry* :test #'equal))
+
 (asdf:defsystem "maxwell"
   :description "A small, image-persistent Common Lisp coding agent harness."
   :author "Maxwell contributors"
   :license "MIT"
   :version "0.1.0"
-  :depends-on ("uiop")
+  :depends-on ("uiop" "alexandria" "fset")
   :serial t
   :components ((:file "src/package")
                (:file "src/json")

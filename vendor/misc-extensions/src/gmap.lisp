@@ -1,0 +1,1170 @@
+;;; -*- Mode: Lisp; Syntax: ANSI-Common-Lisp; Package: GMap -*-
+
+;;; This file is in the public domain.  It is provided with ABSOLUTELY 
+;;; NO WARRANTY.
+
+(in-package gmap)
+
+;;;
+;;; GMAP, version 4.0, by Scott L. Burson
+;;;
+;;; This file is in the public domain.
+;;;
+;;; CHANGES:
+;;;
+;;; Version 4.0, 2024-05-21:
+;;;
+;;; () New syntax adds `:arg' and `:result' keywords, so that the arg and result
+;;; type names no longer have a reason to be in the keyword package.
+;;;
+;;; Version 3.3, 2007-07-04:
+;;;
+;;; () Revamped arg types `:index' and `:index-inc' (incompatibly).
+;;; () Added doc strings, including on the predefined arg- and result-types,
+;;;    and arranged for them to be placed on the symbol-plist, where there's
+;;;    an outside chance someone might find them.
+;;; () Revamped result types `:vector' and `:string' (incompatibly).
+;;; () Removed deprecated arg- and result-types `:array'.
+;;; () Changed most optional arguments to arg- and result-types to keyword
+;;;    arguments.
+;;; () Substantially expanded the multiple-value capability.  Now it is possible
+;;;    for an arg-spec to generate any number of arguments to the function being
+;;;    mapped, and for a single result-spec to consume more than one value
+;;;    returned by that function.
+;;; () Using the new multiple-value capabilities, added `:alist' and `:plist'
+;;;    as both arg- and result-types.
+;;;
+;;; Thanks to Joerg Hoehle for some useful suggestions.
+;;;
+;;; DOCUMENTATION:
+;;;
+;;; See the GMap section of `README.md', and the doc strings below.
+;;;
+
+;;; The top-level macro.
+(defmacro gmap (res-spec fn &rest arg-specs)
+  "A generalized mapping macro.  Applies `fn' to the successive values generated
+by the `arg-specs', analagously to `mapcar'; that is, on each iteration, each
+arg-spec yields one value, and `fn' is called with these values as arguments.
+\(`fn' can be given as `:id', which is equivalent to `#'values'.\)
+The values returned by `fn' are accumulated into a result according to
+`res-spec'.  The `res-spec' is either a list whose car is a predefined result
+type, or a list whose car is `nil' and whose cdr has the same form as the value
+of a result type expander (see `def-gmap-res-type'); or, the `res-spec' can be
+a symbol, which is shorthand for a list of that symbol; or, it can be a list
+whose car is `:values' and whose cdr is a list of result-specs.  Similarly,
+each of the `arg-specs' is either a list whose car is a predefined arg type,
+or a list whose car is `nil' and whose cdr has the same form as the value of
+an arg type expander (see `def-gmap-arg-type')."
+  (unless arg-specs
+    (error "At least one argument spec is required."))
+  (let ((arg-specs-orig arg-specs)
+	(arg-specs (mapcar #'gmap>arg-spec-lookup arg-specs))
+	((result (gmap>expand fn (gmap>res-spec-lookup res-spec) arg-specs))))
+    ;; Catch arg type defs that have a driver and let-specs, but haven't added separate
+    ;; let-specs for the driver yet.
+    (mapc (lambda (arg-spec arg-spec-orig)
+	    (when (and (seventh arg-spec) (fifth arg-spec) (< (length arg-spec) 8))
+	      (error "Driver with no let-specs: ~A" arg-spec-orig)))
+	  arg-specs arg-specs-orig)
+    (reduce (lambda (expansion arg-spec)
+	      (let ((wrapper-fn (sixth arg-spec)))
+		(if wrapper-fn (funcall wrapper-fn expansion)
+		  expansion)))
+	    arg-specs :initial-value result)))
+
+;;; This does the real work.
+;;; (Sorry for the weird Multics-influenced naming convention, but these are
+;;; internal symbols anyway.)
+(defun gmap>expand (fn res-specs arg-specs)
+  (let* ((driver-arg (position-if #'seventh arg-specs))
+	 (driver (and driver-arg (seventh (nth driver-arg arg-specs))))
+	 (arg-specs (if driver-arg
+			(let ((driver-spec (nth driver-arg arg-specs)))
+			  (append (subseq arg-specs 0 driver-arg)
+				  (cons `(:driver nil ,(third driver-spec) nil
+						  ,(eighth driver-spec))
+					(subseq arg-specs (1+ driver-arg)))))
+		      arg-specs))
+	 (param-list (mapcar #'gmap>param arg-specs))
+	 (result-list (gmap>res>init-clauses res-specs))
+	 (let-specs (gmap>let-specs arg-specs res-specs)))
+    (let ((one-value-p (null (cdr result-list)))
+	  (multi-vars (mapcar #'gmap>param>multi-vars arg-specs))
+	  (fnval-vars (mapcan #'(lambda (res-spec)
+				  (and res-spec
+				       (let ((resfn (second res-spec)))
+					 (if (and (consp resfn)
+						  (eq (first resfn) ':consume))
+					     (let ((vars nil))
+					       (dotimes (i (second resfn))
+						 (push (gensym "VAR-") vars))
+					       (nreverse vars))
+					   (list (gensym "VAR-"))))))
+			      res-specs)))
+      `(let ,let-specs
+	 (let (,@(reduce #'append
+			 (mapcar (lambda (clause arg-spec)
+				   (and (not (eq (car arg-spec) ':driver))
+					(list (list (first clause) (second clause)))))
+				 param-list arg-specs))
+	       . ,result-list)
+	   (,@(if driver
+		  `(,(first driver) (,@(or (nth driver-arg multi-vars)
+					   (list (car (nth driver-arg param-list))))
+				     ,@(rest driver)
+				     ,(gmap>res>cleanup res-specs result-list one-value-p)))
+		'(loop))
+	    ,@(let ((exit-tests (apply #'append (mapcar #'gmap>param>exit-test
+							param-list arg-specs))))
+		(and exit-tests
+		     `((when (or . ,exit-tests)
+			 (return ,(gmap>res>cleanup res-specs result-list one-value-p))))))
+	    (let ,(reduce #'append
+			  (mapcar #'gmap>param>multi-let-specs
+				  param-list arg-specs multi-vars))
+	      ,(if (null fnval-vars)
+		   ;; Null result spec -- just call the function for effect.
+		   (apply #'gmap>funcall fn
+			  (reduce #'append
+				  (mapcar #'gmap>param>arg
+					  param-list arg-specs multi-vars)))
+		 `(let ((,@fnval-vars
+			  ,(apply #'gmap>funcall fn
+				  (reduce #'append
+					  (mapcar #'gmap>param>arg
+						  param-list arg-specs multi-vars)))))
+		    . ,(let ((setqs nil))
+			 (do ((res-specs res-specs (cdr res-specs))
+			      (result-list result-list (cdr result-list)))
+			     ((null res-specs))
+			   (let ((next-exp fnvs
+				   (gmap>res>next (car res-specs) (caar result-list)
+						  fnval-vars)))
+			     (setq fnval-vars fnvs)
+			     (push `(setq ,(caar result-list) ,next-exp) setqs)))
+			 (nreverse setqs)))))
+	    ,@(reduce #'append
+		      (mapcar (lambda (clause arg-spec)
+				(and (not (eq (car arg-spec) ':driver))
+				     (third clause)
+				     `((setq ,(first clause) ,(third clause)))))
+			      param-list arg-specs))))))))
+
+
+;;; extract the let-specs.
+(defun gmap>let-specs (arg-specs res-specs)
+  (append (reduce #'append (mapcar #'fifth arg-specs))
+	  (reduce #'append (mapcar #'fifth res-specs))))
+
+;;; generate the do-variable spec for each argument.
+(defun gmap>param (arg-spec)
+  (let ((param-name (gensym "VAR-"))
+	(init (first arg-spec))
+	(nextfn (fourth arg-spec)))
+    `(,param-name
+      ,init
+      ,@(and nextfn `(,(gmap>funcall nextfn param-name))))))
+
+;;; get the argument to the function being mapped from the do-variable.
+(defun gmap>param>arg (param arg-spec multi-vars)
+  (let ((param-name (first param))
+	(argfn (third arg-spec)))
+    (or multi-vars
+	(and (eq (car arg-spec) ':driver) (list param-name))
+	`(,(gmap>funcall argfn param-name)))))
+
+;;; get the exit test for the variable.
+(defun gmap>param>exit-test (param arg-spec)
+  (let ((param-name (first param))
+	(exitp (and (not (eq (car arg-spec) ':driver))
+		    (second arg-spec))))
+    (and exitp `(,(gmap>funcall exitp param-name)))))
+
+(defun gmap>param>multi-vars (arg-spec)
+  (let ((argfn (third arg-spec)))
+    (and (consp argfn) (eq (first argfn) ':values)
+	 ;; (gmap :list (lambda (i) (gensym))
+	 ;;       (:index 0 (cadr argfn)))
+	 (let ((vars nil))
+	   (dotimes (i (second argfn))
+	     (push (gensym "VAR-") vars))
+	   (nreverse vars)))))
+
+(defun gmap>param>multi-let-specs (param arg-spec multi-vars)
+  (let ((argfn (third arg-spec)))
+    (and multi-vars (not (eq (car arg-spec) ':driver))
+	 `((,@multi-vars ,(gmap>funcall (third argfn) (first param)))))))
+
+;;; get the initial value of the result.
+(defun gmap>res>init-clauses (res-specs)
+  (reduce #'append
+	  (mapcar #'(lambda (res-spec)
+		      (and res-spec
+			   (list (list (gensym "VAR-") (first res-spec)))))
+		  res-specs)))
+
+;;; compute the next value of the result from the current one and the
+;;; current value of the function.
+(defun gmap>res>next (res-spec result fnvals)
+  (let ((resfn (second res-spec))
+	(filterp (fourth res-spec))
+	((n-fnvals resfn
+	   (if (and (consp resfn) (eq (first resfn) ':consume))
+	       (values (second resfn) (third resfn))
+	     (values 1 resfn)))
+	 ((my-fnvals (subseq fnvals 0 n-fnvals)))))
+    (values (if filterp
+		`(if ,(apply #'gmap>funcall filterp my-fnvals)
+		     ,(apply #'gmap>funcall resfn result my-fnvals)
+		   ,result)
+	      (apply #'gmap>funcall resfn result my-fnvals))
+	    (subseq fnvals n-fnvals))))
+
+;;; call the cleanup function on exit.
+(defun gmap>res>cleanup (res-specs result-list one-value-p)
+  (if one-value-p
+      (gmap>funcall (third (car res-specs)) (caar result-list))
+    `(values . ,(mapcar #'(lambda (res-spec result-pair)
+			    (gmap>funcall (third res-spec) (car result-pair)))
+			res-specs result-list))))
+
+;;; For some reason, some compilers don't convert, e.g., (funcall #'car foo)
+;;; to (car foo); thus we lose some efficiency for functions that would normally
+;;; open-code, like car.  Hence this function to perform the optimization.  Also
+;;; cleans up the expansion a bit.
+(defun gmap>funcall (function &rest args)
+  (let ((args (copy-list args)))
+    (cond ((or (null function) (eq function ':id))
+	   `(values . ,args))
+	  ((and (listp function)
+		(eq (car function) 'function))
+	   `(,(cadr function) . ,args))
+	  ((and (listp function)
+		(eq (car function) 'lambda))
+	   `(,function . ,args))
+	  ((and (listp function) (eq (car function) 'fn))
+	   (apply #'gmap>funcall (macroexpand function) args))
+	  (t `(funcall ,function . ,args)))))
+
+
+(eval-when (:execute :compile-toplevel :load-toplevel)
+  (defvar *gmap-arg-type-list* nil
+    "A list of all GMAP arg types that have been defined.")
+  (defvar *gmap-result-type-list* nil
+    "A list of all GMAP result types that have been defined."))
+
+(define-condition keyword-name-deprecated (style-warning)
+    ((kind :initarg :kind :reader kind
+       :documentation "One of { :arg, :res }.")
+     (name :initarg :name :reader name))
+  (:report
+    (lambda (condition stream)
+      (format stream
+	      "def-gmap-~(~A~)-type ~S: the use of keyword names with gmap:def-gmap-~(~A~)-type~@
+	       is deprecated.  Use a name in the package that defines the type you~@
+	       wish to iterate over.  For backward compatibility, the keyword name~@
+	       will also be defined, but references to it are also deprecated; instead,~@
+	       use `(:~A <type> ...)'."
+	      (kind condition) (name condition) (kind condition)
+	      (if (eq (kind condition) ':res) "result" "arg")))))
+
+(defmacro def-gmap-arg-type (name args &body body)
+  "Defines a GMap arg-type.  Syntax is identical to `defun'.  The body should
+return a list of 1 to 5 elements: (0, \"init\") the initial value of the
+state variable; (1, \"exitp\"), if non-nil, a function of one argument which
+is called on the state variable, a true result causing the iteration to
+exit; (2, \"argfn\"), if non-nil, a function of one argument which is called
+on the state variable to get the value to be used on this iteration; (3,
+\"nextfn\"), if non-nil, a function of one argument which is called on the
+state variable to get the new value of same; (4, \"let-specs\") a list of
+clauses for an `nlet' that will be wrapped around the entire expansion; and
+\(5, \"wrapper-fn\"), if non-nil, a function to be called on the entire
+expansion, whose result will be used as the new entire expansion.
+
+It is also possible for an arg-type to generate multiple arguments.  If
+element 2, \"argfn\", is of the form `(:values N FN)', FN should be a function
+returning N values, which will be passed as separate arguments to the function
+being mapped.
+
+This is the backward-compatibility version of this macro; when `name' is not
+in the keyword package, it also tries to identically define the keyword symbol
+of the same name, though it checks for collisions first.  If a collision does
+occur, you can resolve it by changing at least one of the `def-gmap-arg-type'
+forms to `def-arg-type', which does not attempt to define the keyword version
+of the name.  Of course, you will also need to update any references in the
+old syntax `(:name ...)' to the new syntax `(:arg name ...)'."
+  (let ((fn-name (or (get name 'arg-type-expander)
+		     (gensym "ARG-TYPE-EXPANDER-")))
+	(kwd-name (and (not (eq (symbol-package name) (find-package "KEYWORD")))
+		       (intern (symbol-name name) (find-package "KEYWORD")))))
+    (unless kwd-name
+      (warn 'keyword-name-deprecated :kind ':arg :name name))
+    ;; CLISP doesn't seem to preserve EQ-ness on fasl-dumped uninterned symbols.
+    #+clisp (setq fn-name (intern (symbol-name fn-name) :gmap))
+    (let ((doc-string body
+	    (if (stringp (car body)) (values (car body) (cdr body))
+	      (values nil body))))
+      `(eval-when (:compile-toplevel :load-toplevel :execute)
+	 (defun ,fn-name ,args . ,body)
+	 (setf (get ',name 'arg-type-expander) ',fn-name)
+	 ;; For backward compatibility, we also define the keyword version of the name.
+	 ,@(and kwd-name
+		`((let ((prev (get ',kwd-name 'arg-type-synonym)))
+		    (when (and prev (not (eq prev ',name)))
+		      (cerror "Proceed, overwriting the previous definition"
+			      "GMAP arg type name collision: ~S was a synonym for ~S,~@
+			       but is now being defined as ~S~@
+			       See gmap:def-gmap-arg-type for more info."
+			      ',kwd-name prev ',name))
+		    (setf (get ',kwd-name 'arg-type-synonym) ',name))))
+	 ,@(and doc-string
+		`((setf (get ',name 'arg-type-doc-string) ,doc-string)))
+	 (pushnew ',name *gmap-arg-type-list*)))))
+
+;;; The 4.0 version of this macro doesn't have "gmap" in the name -- which was redundant
+;;; anyway.  It requires `name' not to be in the keyword package, and does not attempt
+;;; to define the corresponding keyword symbol.  Thus, the name will be usable only with
+;;; the new `(:arg name ...)' syntax, not the old `(:name ...)' syntax.  But there will
+;;; also be no danger of a collision.
+(defmacro def-arg-type (name args &body body)
+  "Defines a GMap arg-type.  Syntax is identical to `defun'.  The body should
+return a list of 1 to 6 elements: (0, \"init\") the initial value of the
+state variable; (1, \"exitp\"), if non-nil, a function of one argument which
+is called on the state variable, a true result causing the iteration to
+exit; (2, \"argfn\"), if non-nil, a function of one argument which is called
+on the state variable to get the value to be used on this iteration; (3,
+\"nextfn\"), if non-nil, a function of one argument which is called on the
+state variable to get the new value of same; (4, \"let-specs\") a list of
+clauses for an `nlet' that will be wrapped around the entire expansion; and
+\(5, \"wrapper-fn\"), if non-nil, a function to be called on the entire
+expansion, whose result will be used as the new entire expansion.
+
+It is also possible for an arg-type to generate multiple arguments.  If
+element 2, \"argfn\", is of the form `(:values N FN)', FN should be a function
+returning N values, which will be passed as separate arguments to the function
+being mapped."
+  (let ((fn-name (or (get name 'arg-type-expander)
+		     (gensym "ARG-TYPE-EXPANDER-"))))
+    (when (eq (symbol-package name) (find-package "KEYWORD"))
+      (error "def-arg-type ~S: the use of keyword names with gmap:def-arg-type is~@
+	     not permitted.  Use a name in the package that defines the type you~@
+	     wish to iterate over.  If you need to define the keyword name for~@
+	     backward compatibility, use `def-gmap-arg-type'."
+	    name))
+    ;; CLISP doesn't seem to preserve EQ-ness on fasl-dumped uninterned symbols.
+    #+clisp (setq fn-name (intern (symbol-name fn-name) :gmap))
+    (let ((doc-string body
+	    (if (stringp (car body)) (values (car body) (cdr body))
+	      (values nil body))))
+      `(eval-when (:compile-toplevel :load-toplevel :execute)
+	 (defun ,fn-name ,args . ,body)
+	 (setf (get ',name 'arg-type-expander) ',fn-name)
+	 ,@(and doc-string
+		`((setf (get ',name 'arg-type-doc-string) ,doc-string)))
+	 (pushnew ',name *gmap-arg-type-list*)))))
+
+(defmacro def-arg-type-synonym (name synonym-of)
+  `(setf (get ',name 'arg-type-synonym) ',synonym-of))
+
+
+(defmacro def-gmap-res-type (name args &body body)
+  "Defines a GMap result-type.  Syntax is identical to `defun'.  The body should
+return a list of 2 to 5 elements: (0, \"init\") the initial value of the state
+variable; (1, \"resfn\") a function of two arguments which is called on the
+state variable and the current value of the function being mapped, returning
+the new value of the state variable; (2, \"cleanup\"), if non-nil, a function
+of one argument which is called on the final value of the state variable to
+get the value of the `gmap' form; (3, \"filterp\"), if non-nil, a predicate
+of one argument which is called on the current value of the function being
+mapped, a false value causing \"resfn\" not to be called on this iteration (and
+the state variable to be unchanged); and (4, \"let-specs\") a list of
+clauses for an `nlet' that will be wrapped around the entire expansion.
+
+It is also possible for a result-type to consume more than one value of the
+function being mapped.  If element 1, \"resfn\", is of the form `(:consume N
+FN)', FN should be a function of N + 1 arguments, and will receive N values
+from the function being mapped.
+
+This is the backward-compatibility version of this macro; when `name' is not
+in the keyword package, it also tries to identically define the keyword symbol
+of the same name, though it checks for collisions first.  If a collision does
+occur, you can resolve it by changing at least one of the `def-gmap-res-type'
+forms to `def-result-type', which does not attempt to define the keyword version
+of the name.  Of course, you will also need to update any references in the
+old syntax `(:name ...)' to the new syntax `(:result name ...)'."
+  (let ((fn-name (or (get name 'res-type-expander)
+		     (gensym "RES-TYPE-EXPANDER-")))
+	(kwd-name (and (not (eq (symbol-package name) (find-package "KEYWORD")))
+		       (intern (symbol-name name) (find-package "KEYWORD")))))
+    (unless kwd-name
+      (warn 'keyword-name-deprecated :kind ':res :name name))
+    ;; CLISP doesn't seem to preserve EQ-ness on fasl-dumped uninterned symbols.
+    #+clisp (setq fn-name (intern (symbol-name fn-name) :gmap))
+    (let ((doc-string body
+	    (if (stringp (car body)) (values (car body) (cdr body))
+	      (values nil body))))
+      `(eval-when (:compile-toplevel :load-toplevel :execute)
+	 (defun ,fn-name ,args . ,body)
+	 (setf (get ',name 'res-type-expander) ',fn-name)
+	 ;; For backward compatibility, we also define the keyword version of the name.
+	 ,@(and kwd-name
+		`((let ((prev (get ',kwd-name 'res-type-synonym)))
+		    (when (and prev (not (eq prev ',name)))
+		      (cerror "Proceed, overwriting the previous definition"
+			      "GMAP result type name collision: ~S was a synonym for ~S,~@
+			       but is now being defined as ~S~@
+			       See gmap:def-gmap-res-type for more info."
+			      ',kwd-name prev ',name))
+		    (setf (get ',kwd-name 'res-type-expander) ',fn-name)
+		    (setf (get ',kwd-name 'res-type-synonym) ',name))))
+	 ,@(and doc-string
+		`((setf (get ',name 'res-type-doc-string) ,doc-string)))
+	 (pushnew ',name *gmap-result-type-list*)))))
+
+;;; The 4.0 version of this macro doesn't have "gmap" in the name -- which was redundant
+;;; anyway.  It requires `name' not to be in the keyword package, and does not attempt
+;;; to define the corresponding keyword symbol.  Thus, the name will be usable only with
+;;; the new `(:result name ...)' syntax, not the old `(:name ...)' syntax.  But there will
+;;; also be no danger of a collision.
+(defmacro def-result-type (name args &body body)
+  "Defines a GMap result-type.  Syntax is identical to `defun'.  The body should
+return a list of 2 to 5 elements: (0, \"init\") the initial value of the state
+variable; (1, \"resfn\") a function of two arguments which is called on the
+state variable and the current value of the function being mapped, returning
+the new value of the state variable; (2, \"cleanup\"), if non-nil, a function
+of one argument which is called on the final value of the state variable to
+get the value of the `gmap' form; (3, \"filterp\"), if non-nil, a predicate
+of one argument which is called on the current value of the function being
+mapped, a false value causing \"resfn\" not to be called on this iteration (and
+the state variable to be unchanged); and (4, \"let-specs\") a list of
+clauses for an `nlet' that will be wrapped around the entire expansion.
+
+It is also possible for a result-type to consume more than one value of the
+function being mapped.  If element 1, \"resfn\", is of the form `(:consume N
+FN)', FN should be a function of N + 1 arguments, and will receive N values
+from the function being mapped."
+  (let ((fn-name (gensym "RES-TYPE-EXPANDER-")))
+    (when (eq (symbol-package name) (find-package "KEYWORD"))
+      (error "def-result-type ~S: the use of keyword names with gmap:def-result-type is~@
+	     not permitted.  Use a name in the package that defines the type you~@
+	     wish to iterate over.  If you need to define the keyword name for~@
+	     backward compatibility, use `def-gmap-res-type'."
+	    name))
+    ;; CLISP doesn't seem to preserve EQ-ness on fasl-dumped uninterned symbols.
+    #+clisp (setq fn-name (intern (symbol-name fn-name) :gmap))
+    (let ((doc-string body
+	    (if (stringp (car body)) (values (car body) (cdr body))
+	      (values nil body))))
+      `(eval-when (:compile-toplevel :load-toplevel :execute)
+	 (defun ,fn-name ,args . ,body)
+	 (setf (get ',name 'res-type-expander) ',fn-name)
+	 ,@(and doc-string
+		`((setf (get ',name 'res-type-doc-string) ,doc-string)))
+	 (pushnew ',name *gmap-result-type-list*)))))
+
+(defmacro def-result-type-synonym (name synonym-of)
+  `(setf (get ',name 'res-type-synonym) ',synonym-of))
+
+
+;;; look up an arg type.
+(defun gmap>arg-spec-lookup (raw-arg-spec)
+  (let ((raw-arg-spec (if (eq (car raw-arg-spec) ':arg) (cdr raw-arg-spec)
+			raw-arg-spec)))
+    (let ((type (car raw-arg-spec)))
+      (if (null type)
+	  (cdr raw-arg-spec)
+	(let ((generator (gmap>arg-expander-lookup type)))
+	  (if generator
+	      (apply generator (cdr raw-arg-spec))
+	    (error "Argument spec, ~S, to gmap is of unknown type~@
+		  (Do you have the package right?)"
+		   raw-arg-spec)))))))
+
+(defun gmap>arg-expander-lookup (arg-type)
+  (let ((synonym (get arg-type 'arg-type-synonym)))
+    (if synonym (gmap>arg-expander-lookup synonym)
+      (or (get arg-type 'arg-type-expander)
+	  ;; Backward compatibility for the old property
+	  (get arg-type ':gmap-arg-spec-expander)))))
+
+;;; look up a result type.
+(defun gmap>res-spec-lookup (raw-res-spec)
+  (let ((raw-res-spec (if (and (listp raw-res-spec) (eq (car raw-res-spec) ':result))
+			  (cdr raw-res-spec)
+			(progn
+			  (when (eq raw-res-spec ':result)
+			    (error "Keyword ':result' must be the car of a sublist"))
+			  raw-res-spec))))
+    (if (and (listp raw-res-spec)
+	     (member (car raw-res-spec) '(values :values)))
+	(mapcar #'gmap>res-spec-lookup-1 (cdr raw-res-spec))
+      (list (gmap>res-spec-lookup-1 raw-res-spec)))))
+(defun gmap>res-spec-lookup-1 (raw-res-spec)
+  (let ((type (if (listp raw-res-spec) (car raw-res-spec)
+		raw-res-spec)))
+    (if (null type)
+	(cdr raw-res-spec)
+      (let ((generator (gmap>res-expander-lookup type)))
+	(if generator
+	    (apply generator (and (listp raw-res-spec) (cdr raw-res-spec)))
+	  (error "Result spec, ~S, to gmap is of unknown type~@
+		  (Do you have the package right?)"
+		 raw-res-spec))))))
+
+(defun gmap>res-expander-lookup (res-type)
+  (let ((synonym (get res-type 'res-type-synonym)))
+    (if synonym (gmap>res-expander-lookup synonym)
+      (or (get res-type 'res-type-expander)
+	  ;; Backward compatibility for the old property
+	  (get res-type ':gmap-res-spec-expander)))))
+
+
+;;; Deprecated; use `def-arg-type-synonym' and/or `def-result-type-synonym' instead.
+(defun copy-gmap-type (from-symbol to-symbol)
+  "If you shadow the name of a CL builtin that is also a GMap arg and/or result
+type, you will want to use this to copy the definition(s) from the CL symbol to
+your shadowing symbol."
+  (setf (get to-symbol 'arg-type-expander) (get from-symbol 'arg-type-expander))
+  (setf (get to-symbol 'arg-type-doc-string) (get from-symbol 'arg-type-doc-string))
+  (setf (get to-symbol 'res-type-expander) (get from-symbol 'res-type-expander))
+  (setf (get to-symbol 'res-type-doc-string) (get from-symbol 'res-type-doc-string)))
+
+
+;;; ******** Predefined argument types ********
+;;; See above for documentation.
+
+(def-gmap-arg-type constant (value)
+  "Yields an unbounded sequence of `value'."
+  `(,value))
+
+(def-gmap-arg-type list (list)
+  "Yields the successive elements of `list'."
+  `(,list
+    #'endp #'car #'cdr))
+
+(def-gmap-arg-type improper-list (list)
+  "Yields the successive elements of `list', which may be improper; any non-consp
+tail terminates the iteration."
+  `(,list
+    #'(lambda (x) (not (consp x)))
+    #'car #'cdr))
+
+(def-gmap-arg-type alist (alist)
+  "Yields, as two values, the successive pairs of `alist'."
+  `(,alist
+    #'endp
+    (:values 2 #'(lambda (alist) (values (caar alist) (cdar alist))))
+    #'cdr))
+
+(def-gmap-arg-type plist (plist)
+  "Yields, as two values, the successive pairs of elements of `plist'; that is,
+there is one iteration for each two elements."
+  `(,plist
+    #'endp
+    (:values 2 #'(lambda (plist) (values (car plist) (cadr plist))))
+    #'cddr))
+
+(def-gmap-arg-type hash-table (ht)
+  "Yields, as two values, the successive pairs of `ht'."
+  (let ((key-tmp (gensym "KEY-"))
+	(val-tmp (gensym "VAL-"))
+	(iter-fn (gensym "HT-ITER-")))
+    `(nil
+      #'(lambda (x)
+	  (declare (ignore x))
+	  (let ((more? key val (,iter-fn)))
+	    (if more?
+		(progn
+		  (setq ,key-tmp key ,val-tmp val)
+		  nil)
+	      t)))
+      (:values 2 #'(lambda (x)
+		     (declare (ignore x))
+		     (values ,key-tmp ,val-tmp)))
+      nil
+      ((,key-tmp nil) (,val-tmp nil))
+      ;; Note the leading comma.  This is called at expansion time, not runtime.
+      ,#'(lambda (expansion)
+	   `(with-hash-table-iterator (,iter-fn ,ht)
+	      ,expansion)))))
+
+(def-gmap-arg-type tails (list)
+  "Yields the successive tails (cdrs) of `list', starting with `list' itself, which
+may be improper."
+  `(,list
+    #'(lambda (x) (not (consp x)))
+    nil #'cdr))
+
+;;; If `incr' is +1 or -1, then swapping `start' and `stop' and negating `incr'
+;;; generates the same sequence in reverse order.  This isn't true, though, in
+;;; general.  Should it be?
+;;; -- Yes, SBCL, I know I have both `&optional' and `&key' here.  Too late to fix it.
+(locally (declare #+sbcl (sb-ext:muffle-conditions style-warning))
+  (def-gmap-arg-type index (&optional (start 0) stop &key (incr 1) (fixnums? t))
+    "Yields integers in the interval [`start', `stop') if `incr' (which defaults
+to 1) is positive; or in the interval [`stop', `start') if `incr' is negative.
+Specifically, in the upward case, the values begin with `start' and increase by
+`incr' until >= `stop'; in the downward case, the values begin with
+`start' - `incr' and decrease by `incr' until < `stop'.  All values are
+assumed to be fixnums unless `fixnums?' is a literal `nil'.  `stop' can be
+omitted or a literal `nil' to indicate an unbounded sequence.  `start' can be
+omitted to start at 0."
+    (let ((incr-temp (gensym "INCR-"))
+	  (stop-temp (gensym "STOP-")))
+      ;; Aargh, have to handle the constant vs. variable cases of `incr' separately
+      ;; to avoid unreachable-code warnings from Python.  (Suggested heuristic:
+      ;; if code becomes unreachable because a variable is bound to a compile-time
+      ;; constant, and the name of the variable is an uninterned symbol, suppress
+      ;; the warning on the grounds that a macro generated the code in question.)
+      `(,(if (numberp incr)			; init
+	     (if (minusp incr)
+		 (if fixnums? `(+ (the fixnum ,start) ,incr)
+		   `(+ ,start ,incr))
+	       start)
+	   `(if (minusp ,incr-temp)
+		,(if fixnums? `(+ (the fixnum ,start) (the fixnum ,incr-temp))
+		   `(+ ,start ,incr-temp))
+	      ,start))
+	,(and stop				; exitp
+	      (if (numberp incr)
+		  (if fixnums?
+		      `#'(lambda (val)
+			   (,(if (minusp incr) '< '>=)
+			    (the fixnum val) (the fixnum ,stop-temp)))
+		    `#'(lambda (val)
+			 (,(if (minusp incr) '< '>=) val ,stop-temp)))
+		`#'(lambda (val)
+		     ,@(and fixnums? `((declare (type fixnum val ,incr-temp ,stop-temp))))
+		     (if (minusp ,incr-temp)
+			 (< val ,stop-temp)
+		       (>= val ,stop-temp)))))
+	nil					; no argfn
+	#'(lambda (val)				; nextfn
+	    ,(if fixnums?
+		 `(the fixnum (+ (the fixnum val)
+				 (the fixnum ,(if (numberp incr) incr incr-temp))))
+	       `(+ val ,(if (numberp incr) incr incr-temp))))
+	(,@(and (not (numberp incr))		; let-specs
+		`((,incr-temp ,incr)))
+	 ,@(and stop
+		`((,stop-temp ,stop))))))))
+
+(def-gmap-arg-type index-inc (start stop &key (incr 1) (fixnums? t))
+  "Yields integers in the interval [`start', `stop'].  Specifically, in the
+upward case (`incr' > 0), the values begin with `start' and increase by
+`incr' until > `stop'; in the downward case, the values begin with `start'
+and decrease by `incr' until < `stop'.  All values are assumed to be fixnums
+unless `fixnums?' is a literal `nil'.  `stop' can be a literal `nil' to
+indicate an unbounded sequence."
+  (let ((incr-temp (gensym "INCR-"))
+	(stop-temp (gensym "STOP-")))
+    ;; Aargh, have to handle the constant vs. variable cases of `incr' separately
+    ;; to avoid unreachable-code warnings from Python.  (Suggested heuristic:
+    ;; if code becomes unreachable because a variable is bound to a compile-time
+    ;; constant, and the name of the variable is an uninterned symbol, suppress
+    ;; the warning on the grounds that a macro generated the code in question.)
+    `(,start
+      ,(and stop				; exitp
+	    (if (numberp incr)
+		(if fixnums?
+		    `#'(lambda (val)
+			 (,(if (minusp incr) '< '>)
+			   (the fixnum val) (the fixnum ,stop-temp)))
+		  `#'(lambda (val)
+		       (,(if (minusp incr) '< '>) val ,stop-temp)))
+	      `#'(lambda (val)
+		   ,@(and fixnums? `((declare (type fixnum val ,incr-temp ,stop-temp))))
+		   (if (minusp ,incr-temp)
+		       (< val ,stop-temp)
+		     (> val ,stop-temp)))))
+      nil					; no argfn
+      #'(lambda (val)				; nextfn
+	  ,(if fixnums?
+	       `(the fixnum (+ (the fixnum val)
+			       (the fixnum ,(if (numberp incr) incr incr-temp))))
+	     `(+ val ,(if (numberp incr) incr incr-temp))))
+      (,@(and (not (numberp incr))		; let-specs
+	      `((,incr-temp ,incr)))
+       ,@(and stop
+	      `((,stop-temp ,stop)))))))
+
+(def-gmap-arg-type exp (initial-value base)
+  "Yields an unbounded exponential sequence starting with `initial-value'
+and multiplying by `base' after each iteration."
+  (let ((base-temp (gensym "BASE-")))
+    `(,initial-value
+      nil
+      nil
+      #'(lambda (x) (* x ,base-temp))
+      ((,base-temp ,base)))))
+
+(def-gmap-arg-type vector (vec &key start stop incr)
+  "Yields elements of vector `vec'.  `start' and `stop' may be supplied to select
+a subsequence of `vec'; `incr' may be supplied (it must be positive) to select
+every second element etc.  For performance, you may prefer `simple-vector'."
+  (let ((vec-temp (gensym "VEC-"))
+	(incr-temp (and incr (gensym "INCR-")))
+	(stop-temp (gensym "STOP-")))
+    `(,(if start `(max (the fixnum ,start) 0) 0)
+      #'(lambda (i) (>= (the fixnum i) ,stop-temp))
+      #'(lambda (i)
+	  ;; At speed 3, the SBCL compiler issues a note if it can't optimize the `aref'
+	  ;; because it doesn't know the upgraded array element type.
+	  (declare (optimize (speed 1) (safety 0))) ; try to suppress redundant bounds check
+	  (aref ,vec-temp i))
+      #'(lambda (i) (the fixnum (+ (the fixnum i) ,(or incr-temp 1))))
+      ((,vec-temp (the vector ,vec))
+       ,@(and incr `((,incr-temp ,incr)))
+       ((,stop-temp (the fixnum ,(if stop `(min ,stop (length ,vec-temp))
+				   `(length ,vec-temp)))))))))
+
+(def-gmap-arg-type simple-vector (vec &key start stop incr)
+  "Yields elements of vector `vec', which is assumed to be simple, and whose size
+is assumed to be a fixnum.  `start' and `stop' may be supplied to select a
+subsequence of `vec'; `incr' may be supplied (it must be positive) to select
+every second element etc."
+  (let ((vec-temp (gensym "VEC-"))
+	(incr-temp (and incr (gensym "INCR-")))
+	(stop-temp (gensym "STOP-")))
+    `(,(if start `(max (the fixnum ,start) 0) 0)
+      #'(lambda (i) (>= (the fixnum i) ,stop-temp))
+      #'(lambda (i)
+	  (declare (optimize (speed 3) (safety 0))) ; try to suppress redundant bounds check
+	  (svref ,vec-temp (the fixnum i)))
+      #'(lambda (i) (the fixnum (+ (the fixnum i) ,(or incr-temp 1))))
+      ((,vec-temp (the simple-vector ,vec))
+       ,@(and incr `((,incr-temp (the fixnum ,incr))))
+       ((,stop-temp (the fixnum ,(if stop `(min ,stop (length ,vec-temp))
+				   `(length ,vec-temp)))))))))
+
+(def-gmap-arg-type string (str &key start stop incr)
+  "Yields elements of string `str'.  `start' and `stop' may be supplied to select
+a subsequence of `vec'; `incr' may be supplied (it must be positive) to select
+every second element etc.  For performance, you may prefer `:simple-string'."
+  (let ((str-temp (gensym "STR-"))
+	(incr-temp (and incr (gensym "INCR-")))
+	(stop-temp (gensym "STOP-")))
+    `(,(if start `(max (the fixnum ,start) 0) 0)
+      #'(lambda (i) (>= i ,stop-temp))
+      #'(lambda (i)
+	  (declare (optimize (speed 3) (safety 0))) ; try to suppress redundant bounds check
+	  (char ,str-temp i))
+      #'(lambda (i) (+ i ,(or incr-temp 1)))
+      ((,str-temp (string ,str))
+       ,@(and incr `((,incr-temp ,incr)))
+       ((,stop-temp ,(if stop `(min ,stop (length ,str-temp))
+		       `(length ,str-temp))))))))
+
+(def-gmap-arg-type simple-string (str &key start stop incr)
+  "Yields elements of string `str', which is assumed to be simple, and whose size
+is assumed to be a fixnum.  `start' and `stop' may be supplied to select a
+subsequence of `str'; `incr' may be supplied (it must be positive) to select
+every second element etc."
+  (let ((str-temp (gensym "STR-"))
+	(incr-temp (and incr (gensym "INCR-")))
+	(stop-temp (gensym "STOP-")))
+    `(,(if start `(max (the fixnum ,start) 0) 0)
+      #'(lambda (i) (>= (the fixnum i) ,stop-temp))
+      #'(lambda (i)
+	  (declare (optimize (speed 3) (safety 0))) ; try to suppress redundant bounds check
+	  (schar ,str-temp (the fixnum i)))
+      #'(lambda (i) (+ (the fixnum i) ,(or incr-temp 1)))
+      ((,str-temp (the simple-string ,str))
+       ,@(and incr `((,incr-temp (the fixnum ,incr))))
+       ((,stop-temp (the fixnum ,(if stop `(min ,stop (length ,str-temp))
+				   `(length ,str-temp)))))))))
+
+(def-gmap-arg-type array (ary &key start stop incr)
+  "Yields elements of array `ary', which may be multidimensional and/or
+specialized.  Access is via `row-major-aref', so the elements are yielded
+in row-major order.  `start' and `stop', which are row-major indices, may
+be supplied to select a subsequence, and `incr' to skip one or more elements
+at each step."
+  (let ((ary-temp (gensym "ARY-"))
+	(incr-temp (and incr (gensym "INCR-")))
+	(stop-temp (gensym "STOP-")))
+    `(,(if start `(max (the fixnum ,start) 0) 0)
+      #'(lambda (i) (>= (the fixnum i) ,stop-temp))
+      #'(lambda (i)
+	  (declare (optimize (speed 1) (safety 0))) ; try to suppress redundant bounds check
+	  (row-major-aref ,ary-temp (the fixnum i)))
+      #'(lambda (i) (+ (the fixnum i) ,(or incr-temp 1)))
+      ((,ary-temp (the array ,ary))
+       ,@(and incr `((,incr-temp (the fixnum ,incr))))
+       ((,stop-temp (the fixnum ,(if stop `(min ,stop (array-total-size ,ary-temp))
+				   `(array-total-size ,ary-temp)))))))))
+
+(def-arg-type file-chars (pathname &key (element-type ''character) (external-format '':default))
+  "Yields the characters of the file named by `pathname'.  `element-type' and
+`external-format' are passed to `open'."
+  (let ((stream-tmp (gensym "STREAM-"))
+	(char-tmp (gensym "CHAR-")))
+    `(nil
+      (fn (_)
+	(setq ,char-tmp (read-char ,stream-tmp nil nil))
+	(null ,char-tmp))
+      (fn (_) ,char-tmp)
+      nil
+      ((,char-tmp nil))
+      ,(fn (expansion)
+	 `(with-open-file (,stream-tmp ,pathname :element-type ,element-type :external-format ,external-format)
+	    ,expansion)))))
+
+(def-arg-type file-lines (pathname &key skip-initial (external-format '':default))
+  "Yields the lines of the file named by `pathname'.  If `skip-initial' is
+given, it is the number of initial lines to skip.  `external-format' is
+passed to `open'."
+  (let ((stream-tmp (gensym "STREAM-"))
+	(line-tmp (gensym "LINE-")))
+    `(nil
+      (fn (_)
+	,(if skip-initial
+	     `(do ((n ,skip-initial (1- n)))
+		  ((zerop n)
+		   (setq ,line-tmp (read-line ,stream-tmp nil nil)))
+		(read-line ,stream-tmp nil nil))
+	   `(setq ,line-tmp (read-line ,stream-tmp nil nil)))
+	(null ,line-tmp))
+      (fn (_) ,line-tmp)
+      nil
+      ((,line-tmp nil))
+      ,(fn (expansion)
+	 `(with-open-file (,stream-tmp ,pathname :external-format ,external-format)
+	    ,expansion)))))
+
+(def-arg-type file-sexps (pathname &key (external-format '':default))
+  "Yields the s-expressions of the file named by `pathname'.  `external-format'
+is passed to `open'."
+  (let ((stream-tmp (gensym "STREAM-"))
+	(sexp-tmp (gensym "CHAR-")))
+    `(nil
+      (fn (_)
+	(setq ,sexp-tmp (read ,stream-tmp nil nil))
+	(null ,sexp-tmp))
+      (fn (_) ,sexp-tmp)
+      nil
+      ((,sexp-tmp nil))
+      ,(fn (expansion)
+	 `(with-open-file (,stream-tmp ,pathname :external-format ,external-format)
+	    ,expansion)))))
+
+
+;;; ******** Predefined result types ********
+
+(def-gmap-res-type list (&key filterp)
+  "Returns a list of the values, optionally filtered by `filterp' \(which
+can be `:id' to filter out `nil'\)."
+  `(nil #'(lambda (x y) (cons y x)) #'nreverse ,filterp))
+
+(def-gmap-res-type alist (&key filterp)
+  "Consumes two values from the mapped function; returns an alist of the
+pairs.  Note that `filterp', if supplied, must take two arguments."
+  `(nil (:consume 2 #'(lambda (res x y) (cons (cons x y) res))) #'nreverse ,filterp))
+
+(def-gmap-res-type plist (&key filterp)
+  "Consumes two values from the mapped function; returns a plist of the
+pairs.  Note that `filterp', if supplied, must take two arguments."
+  `(nil (:consume 2 #'(lambda (res x y) (cons y (cons x res)))) #'nreverse ,filterp))
+
+(def-gmap-res-type hash-table (&key test size rehash-size rehash-threshold filterp)
+  "Consumes two values from the mapped function; returns a hash-table of
+the pairs.  If any of `test', `size', `rehash-size', or `rehash-threshold' are
+supplied, they are passed to `make-hash-table'.  Note that `filterp', if supplied,
+must take two arguments."
+  `((make-hash-table ,@(and test `(:test ,test))
+		     ,@(and size `(:size ,size))
+		     ,@(and rehash-size `(:rehash-size ,rehash-size))
+		     ,@(and rehash-threshold `(:rehash-threshold ,rehash-threshold)))
+    (:consume 2 #'(lambda (ht k v) (setf (gethash k ht) v) ht))
+    nil
+    ,filterp))
+
+(def-gmap-res-type append (&key filterp)
+  "Returns the result of `append'ing the values, optionally filtered by
+`filterp' (that is, each list is filtered as a whole, not its individual
+elements) \(`filterp' can be `:id' to filter out `nil'\)."
+  `(nil
+    #'(lambda (old new) (revappend new old))
+    #'nreverse
+    ,filterp))
+
+(def-gmap-res-type nconc (&key filterp)
+  "Returns the result of `nconc'ing the values, optionally filtered by
+`filterp' (that is, each list is filtered as a whole, not its individual
+elements) \(`filterp' can be `:id' to filter out `nil'\)."
+  (let ((result-var (gensym "RESULT-")))	; have to use our own, sigh.
+    `(nil					; init
+      #'(lambda (tail-loc new)			; nextfn
+	  (if tail-loc (rplacd tail-loc new)
+	    (setq ,result-var new))
+	  (if new (last new) tail-loc))
+      #'(lambda (ignore)
+	  (declare (ignore ignore))
+	  ,result-var)
+      ,filterp
+      ((,result-var nil)))))
+
+(def-gmap-res-type and ()
+  "If one of the values is false, terminates the iteration and returns false;
+otherwise, returns the last value.  Does not work as an operand of `:values'."
+  '(t #'(lambda (ignore new)
+	  (declare (ignore ignore))
+	  (if new new (return nil)))))
+
+(def-gmap-res-type or ()
+  "If one of the values is true, terminates the iteration and returns it;
+otherwise, returns false.  Does not work as an operand of `:values'."
+  '(nil #'(lambda (ignore new)
+	    (declare (ignore ignore))
+	    (if new (return new) nil))))
+
+(def-gmap-res-type sum (&key filterp)
+  "Returns the sum of the values, optionally filtered by `filterp'
+\(`filterp' can be `:id' to filter out `nil'\)."
+  `(0 #'+ nil ,filterp))
+
+(def-gmap-res-type product (&key filterp)
+  "Returns the product of the values, optionally filtered by `filterp'
+\(`filterp' can be `:id' to filter out `nil'\)."
+  `(1 #'* nil ,filterp))
+
+(def-result-type logior (&key filterp)
+  "Returns the bitwise-OR of the values, optionally filtered by `filterp'
+\(`filterp' can be `:id' to filter out `nil'\)."
+  `(0 #'logior nil ,filterp))
+
+(def-result-type logand (&key filterp)
+  "Returns the bitwise-AND of the values, optionally filtered by `filterp'
+\(`filterp' can be `:id' to filter out `nil'\)."
+  `(0 #'logand nil ,filterp))
+
+(def-gmap-res-type count ()
+  "Returns the number of true values."
+  '(0 #'(lambda (n new)
+	  (if new (1+ n) n))))
+
+;;; Old name for `count'; deprecated.
+(def-gmap-res-type count-if ()
+  "Returns the number of true values."
+  '(0 #'(lambda (n new)
+	  (if new (1+ n) n))))
+
+(def-gmap-res-type max (&key filterp key)
+  "Optionally filters the values by `filterp', then returns the maximum, or if `key'
+is supplied, the value with the maximum key (if that's not unique, returns the first
+one); or `nil' if no values were supplied (or survived filtering).  Example:
+
+   (gmap (:result max :key #'cdr) nil (:arg list alist))
+
+returns the (first) pair of `alist' with the maximum `cdr'.
+
+If `key' is `:second-value', the second value of the mapped function is used; for example,
+
+   (gmap (:result max :key :second-value) nil (:arg alist an-alist))
+
+returns the (first) `car' of `an-alist' with the maximum corresponding `cdr'."
+  (if key
+      (let ((key-val-var (gensym "KEY-VAL-")))
+	`(nil
+	   ,(if (eq key ':second-value)
+		`(:consume 2 #'(lambda (old new key)
+				 (if (or (null ,key-val-var) (> key ,key-val-var))
+				     (progn
+				       (setq ,key-val-var key)
+				       new)
+				   old)))
+	      `#'(lambda (old new)
+		   (let ((new-key-val ,(gmap>funcall key 'new)))
+		     (if (or (null ,key-val-var) (> new-key-val ,key-val-var))
+			 (progn
+			   (setq ,key-val-var new-key-val)
+			   new)
+		       old))))
+	   nil ,filterp ((,key-val-var nil))))
+    `(nil
+      #'(lambda (old new) (if (null old) new (max old new)))
+      nil
+      ,filterp)))
+
+(def-gmap-res-type min (&key filterp key)
+  "Optionally filters the values by `filterp', then returns the minimum, or if `key'
+is supplied, the value with the minimum key (if that's not unique, returns the first
+one); or `nil' if no values were supplied (or survived filtering).  Example:
+
+   (gmap (:result min :key #'cdr) nil (:arg list an-alist))
+
+returns the (first) pair of `an-alist' with the minimum `cdr'.
+
+If `key' is `:second-value', the second value of the mapped function is used; for example,
+
+   (gmap (:result min :key :second-value) nil (:arg alist an-alist))
+
+returns the (first) `car' of `an-alist' with the minimum corresponding `cdr'."
+  (if key
+      (let ((key-val-var (gensym "KEY-VAL-")))
+	`(nil
+	   ,(if (eq key ':second-value)
+		`(:consume 2 #'(lambda (old new key)
+				 (if (or (null ,key-val-var) (< key ,key-val-var))
+				     (progn
+				       (setq ,key-val-var key)
+				       new)
+				   old)))
+	      `#'(lambda (old new) (let ((new-key-val ,(gmap>funcall key 'new)))
+				     (if (or (null ,key-val-var) (< new-key-val ,key-val-var))
+					 (progn
+					   (setq ,key-val-var new-key-val)
+					   new)
+				       old))))
+	   nil
+	   ,filterp
+	   ((,key-val-var nil))))
+    `(nil
+      #'(lambda (old new) (if (null old) new (min old new)))
+      nil
+      ,filterp)))
+
+(def-gmap-res-type vector (&key use-vector length fill-pointer adjustable filterp)
+  "Constructs a vector containing the results.  If `use-vector' is supplied,
+the argument will be filled with the results and returned; if `fill-pointer'
+is true and `adjustable' is true, it must have a fill pointer and be adjustable,
+and values will be appended to it with `vector-push-extend'; if `fill-pointer'
+is true and `adjustable' is false, it must have a fill pointer, and values will
+be appended to it with `vector-push'; otherwise, the vector is assumed to be
+simple and must be large enough to hold the results.  (Recall that `vector-push'
+has no effect if the vector is full.)
+
+If `use-vector' is not supplied, a vector will be constructed and returned;
+if `length' is supplied, returns a simple vector of the specified length (which
+must be sufficient to hold the results); otherwise, returns a simple vector of
+the correct length (but to do this, it must cons a temporary list).
+
+In any case, if `filterp' is supplied, it is a predicate of one argument,
+the value of the function being mapped, that says whether to include it in
+the result \(`filterp' can be `:id' to filter out `nil'\)."
+  (cond ((and use-vector fill-pointer)
+	 `(,use-vector
+	   #'(lambda (vec next-elt)
+	       (,(if adjustable
+		     'vector-push-extend
+		   'vector-push)
+		next-elt vec)
+	       vec)
+	   nil
+	   ,filterp))
+	((and use-vector length)
+	 (error "Makes no sense to supply both `:use-vector' and `:length'"))
+	(use-vector
+	 (let ((index-temp (gensym "INDEX-")))
+	   `(,use-vector
+	     #'(lambda (vec next-elt)
+		 (setf (svref vec (the fixnum ,index-temp)) next-elt)
+		 (incf (the fixnum ,index-temp))
+		 vec)
+	     nil
+	     ,filterp
+	     ((,index-temp 0)))))
+	(length
+	 (let ((index-temp (gensym "INDEX-")))
+	   `((make-array ,length)
+	     #'(lambda (vec next-elt)
+		 (setf (svref vec (the fixnum ,index-temp)) next-elt)
+		 (incf (the fixnum ,index-temp))
+		 vec)
+	     nil
+	     ,filterp
+	     ((,index-temp 0)))))
+	(t
+	 (let ((len-temp (gensym "LEN-")))
+	   `(nil
+	     #'(lambda (list next-elt)
+		 (incf (the fixnum ,len-temp))
+		 (cons next-elt list))
+	     #'(lambda (list)
+		 (let ((vec (make-array (the fixnum ,len-temp))))
+		   (dolist (x list)
+		     (setf (svref vec (decf (the fixnum ,len-temp))) x))
+		   vec))
+	     ,filterp
+	     ((,len-temp 0)))))))
+
+(def-gmap-res-type string (&key use-string length fill-pointer adjustable filterp)
+  "Constructs a string containing the results.  If `use-string' is supplied,
+the argument will be filled with the results and returned; if `fill-pointer'
+is true and `adjustable' is true, it must have a fill pointer and be adjustable,
+and values will be appended to it with `vector-push-extend'; if `fill-pointer'
+is true and `adjustable' is false, it must have a fill pointer, and values will
+be appended to it with `vector-push'; otherwise, the vector is assumed to be
+simple and must be large enough to hold the results.  (Recall that `vector-push'
+has no effect if the vector is full.)
+
+If `use-string' is not supplied, a string will be constructed and returned;
+if `length' is supplied, returns a simple string of the specified length (which
+must be sufficient to hold the results); otherwise, returns a simple string of
+the correct length (but to do this, it must cons a temporary list).
+
+In any case, if `filterp' is supplied, it is a predicate of one argument,
+the value of the function being mapped, that says whether to include it in
+the result \(`filterp' can be `:id' to filter out `nil'\)."
+  (cond ((and use-string fill-pointer)
+	 `(,use-string
+	   #'(lambda (str next-elt)
+	       (,(if adjustable
+		     'vector-push-extend
+		   'vector-push)
+		next-elt str)
+	       str)
+	   nil
+	   ,filterp))
+	(use-string
+	 (let ((index-temp (gensym "INDEX-")))
+	   `(,use-string
+	     #'(lambda (vec next-elt)
+		 (setf (schar vec (the fixnum ,index-temp)) next-elt)
+		 (incf (the fixnum ,index-temp))
+		 vec)
+	     nil
+	     ,filterp
+	     ((,index-temp 0)))))
+	(length
+	 (let ((index-temp (gensym "INDEX-")))
+	   `((make-string ,length)
+	     #'(lambda (vec next-elt)
+		 (setf (schar vec (the fixnum ,index-temp)) next-elt)
+		 (incf (the fixnum ,index-temp))
+		 vec)
+	     nil
+	     ,filterp
+	     ((,index-temp 0)))))
+	(t
+	 (let ((len-temp (gensym "LEN-")))
+	   `(nil				; init
+	     #'(lambda (list next-elt)		; nextfn
+		 (incf (the fixnum ,len-temp))
+		 (cons next-elt list))
+	     #'(lambda (list)			; cleanup
+		 (let ((str (make-string (the fixnum ,len-temp))))
+		   (dolist (x list)
+		     (setf (schar str (decf (the fixnum ,len-temp))) x))
+		   str))
+	     ,filterp
+	     ((,len-temp 0)))))))
+
+(def-gmap-res-type array (dims &key (element-type t) (initial-element nil initial-element?) filterp)
+  "Constructs an array containing the results.  Passes `dims', and `element-type'
+and `initial-element' if supplied, to `make-array'.  If the array is
+multidimensional, fills it in row-major order using `row-major-aref'."
+  (let ((index-temp (gensym "INDEX-")))
+    `((make-array ,dims :element-type ,element-type
+		  . ,(and initial-element? `(:initial-element ,initial-element)))
+      #'(lambda (ary next-elt)
+	  (setf (row-major-aref ary (the fixnum ,index-temp)) next-elt)
+	  (incf (the fixnum ,index-temp))
+	  ary)
+      nil
+      ,filterp
+      ((,index-temp 0)))))
+
+
+; End of gmap.lisp

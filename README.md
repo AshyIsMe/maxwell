@@ -13,8 +13,11 @@ in a single executable SBCL image that Maxwell checkpoints itself into.
 
 ## Run it
 
-Maxwell has no Lisp library dependencies beyond ASDF/UIOP, which ships with
-SBCL. HTTP requests use `curl` internally; `curl` is not exposed as an agent
+Maxwell needs only SBCL: ASDF/UIOP ship with it, and its two Lisp libraries,
+[Alexandria](https://alexandria.common-lisp.dev/) and
+[FSet](https://github.com/slburson/fset), are vendored in the repository (see
+[Vendored libraries](#vendored-libraries)). Nothing is fetched at build or run
+time, and Quicklisp is not needed. HTTP requests use `curl` internally; `curl` is not exposed as an agent
 tool. Native ChatGPT OAuth additionally uses `openssl` for PKCE and ID-token
 signature verification. To skip API-key variables entirely, see
 [Signing in](#signing-in).
@@ -244,6 +247,25 @@ steering during a request (it serves a deliberately slow fake provider on a
 local port); and `python3 tests/checkpoint-pty.py` for saving, restarting, the
 lock, and moving the chat between builds. All of them keep their images,
 sessions, and logins in a temporary directory.
+
+### Vendored libraries
+
+`vendor/` holds pinned copies of Alexandria and FSet, with FSet's own
+dependencies (misc-extensions, mt19937, named-readtables, and the
+mgl-pax-bootstrap part of mgl-pax). `maxwell.asd` puts them at the front of
+ASDF's central registry, so `make build`, `sbcl --script maxwell.lisp`, and
+`/reload` always use these copies, whatever else is installed, and leave your
+own ASDF configuration alone.
+
+Inside Maxwell, and in the model's `common_lisp` calls, they are reached
+through package-local nicknames: `a:` for Alexandria and `f:` for FSet
+(`(f:with (f:empty-map) :k 1)`). FSet shadows many CL names such as `find`,
+`remove`, and `union`, so neither package `:use`s it.
+
+To update, change a pin in `vendor/fetch.sh` (each is a commit, with its tag in
+a comment), run the script, and review the diff. FSet is pinned from upstream
+rather than from the Quicklisp dist, which lags behind and lacks the
+misc-extensions version FSet 2.5 requires.
 
 ## Memory: one endless chat
 
