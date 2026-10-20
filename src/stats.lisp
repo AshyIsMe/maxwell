@@ -179,7 +179,7 @@ never shown."
             (format out "Last ~D request~:P (newest first):" (length shown))
             (dolist (stat shown)
               (format out "~&  ~A" (request-stat-line stat)))
-            (format out "~&Average over ~D request~:P:~@[ first token ~,2Fs,~]~@[ ~,1F tok/s,~]~@[ ~:D tokens,~]"
+            (format out "~&Average over ~D request~:P:~@[ first token ~,2Fs,~]~@[ ~,1F tok/s,~]~@[ ~:D tokens~]"
                     (length stats)
                     (average-value latencies)
                     (average-value rates)
