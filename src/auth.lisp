@@ -701,6 +701,9 @@ HTTP-STATUS of GET /models shows the key works."
       ((string= http-status "403")
        (format nil "Safe AI Labs refused the key~@[ (~A)~]. Check its permissions at ~A."
                code +safeai-keys-url+))
+      ((string= http-status "429")
+       (format nil "Safe AI Labs is rate limiting this key~@[ (~A)~]. Its quota may be used up; check it at ~A, or wait and try again."
+               code +safeai-keys-url+))
       ((string= http-status "000")
        "Could not reach Safe AI Labs.")
       (t
@@ -752,10 +755,14 @@ owner-only. Returns the model to use: MAXWELL_SAFEAI_MODEL or the first listed."
         (fetch-models-response base-url key)
       (let ((problem (safeai-key-check-message http-status body curl-status)))
         (when problem (error problem)))
-      (let ((model (or (environment-value "MAXWELL_SAFEAI_MODEL")
-                       (car (first (model-catalog-from-body body)))
-                       (error "Safe AI Labs listed no models. Set MAXWELL_SAFEAI_MODEL.")))
-            (path (safeai-auth-file-path)))
+      (let* ((catalog (model-catalog-from-body body))
+             (model (or (environment-value "MAXWELL_SAFEAI_MODEL")
+                        (car (first catalog))
+                        (error "Safe AI Labs listed no models. Set MAXWELL_SAFEAI_MODEL.")))
+             (path (safeai-auth-file-path)))
+        (when (and catalog (not (find model catalog :key #'car :test #'string=)))
+          (format t "Warning: MAXWELL_SAFEAI_MODEL is ~A, which Safe AI Labs does not list. Available: ~{~A~^, ~}.~%"
+                  model (mapcar #'car catalog)))
         (write-private-json-file
           (json-object "api_key" key
                        "base_url" base-url

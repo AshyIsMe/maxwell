@@ -613,9 +613,31 @@
   (check (search "Sail" (maxwell::safeai-key-check-message
                           "403" "error: sail_key_requires_sail")))
   (check (search "refused" (maxwell::safeai-key-check-message "403" "")))
+  (check (search "rate limiting" (maxwell::safeai-key-check-message "429" "")))
   (check (search "HTTP 500" (maxwell::safeai-key-check-message "500" "oops")))
   (check (search "Could not reach"
                  (maxwell::safeai-key-check-message "000" "" 6))))
+
+(defun test-unavailable-model-messages ()
+  (let ((message (maxwell::response-error-message
+                   "{\"error\":{\"message\":\"slow down\"}}" "429" "")))
+    (check (search "rate limiting" message))
+    (check (search "slow down" message))
+    (check (search "/model" message)))
+  (check (search "status 500" (maxwell::response-error-message "oops" "500" "")))
+  (let ((client (maxwell:make-client :base-url "https://models.example/v1"
+                                     :model "old-model")))
+    (let ((note (maxwell::unlisted-model-note
+                  client '(("new-model" . "New") ("other" . "other")))))
+      (check (search "old-model" note))
+      (check (search "new-model, other" note)))
+    (check (null (maxwell::unlisted-model-note client '(("old-model" . "Old")))))
+    ;; An empty or unreachable catalog proves nothing about the model.
+    (check (null (maxwell::unlisted-model-note client '())))
+    ;; A failure whose status cannot mean a bad model keeps its message as is.
+    (let ((condition (make-condition 'maxwell::provider-error :message "boom")))
+      (check (eq condition (maxwell::note-unlisted-model
+                             client (format nil "oops~%500") condition))))))
 
 (defun test-private-credential-header ()
   ;; The bearer token travels in an owner-only file, never on the command line.
@@ -908,6 +930,7 @@
     (test-session-memory)
     (test-safeai-credentials)
     (test-safeai-key-checks)
+    (test-unavailable-model-messages)
     (test-private-credential-header)
     (test-provider-presets)
     (test-steering-input)

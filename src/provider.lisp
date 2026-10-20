@@ -125,9 +125,13 @@ client keeps it and no other request field is disturbed."
                      (error (get-key json "error")))
                 (or (and (hash-table-p error) (get-key error "message")) body))
             (condition () body))))
-    (format nil "Provider request failed (HTTP/process status ~A): ~A~@[~%~A~]"
-            status detail
-            (and (plusp (length stderr)) stderr))))
+    (if (equal status "429")
+        (format nil "The provider is rate limiting requests (HTTP 429): ~A~@[~%~A~]~%~
+Your key may have reached its quota, or the model may have no capacity left. Wait and try again, or pick another model with /model."
+                detail (and (plusp (length stderr)) stderr))
+        (format nil "Provider request failed (HTTP/process status ~A): ~A~@[~%~A~]"
+                status detail
+                (and (plusp (length stderr)) stderr)))))
 
 (defun chat-message (message)
   "Copy MESSAGE while removing Maxwell's provider-private bookkeeping keys and
@@ -727,6 +731,38 @@ asked for as a stream, and WIRE-API which stream it is."
                                   (if streamed-p "SSE" "JSON")
                                   condition response-body)))))))
 
+(defparameter +model-check-statuses+ '("400" "404" "422" "429")
+  "HTTP statuses a provider may answer when the requested model is gone. The
+catalog is consulted only after one of these, so a healthy request costs nothing.")
+
+(defun unlisted-model-note (client models)
+  "A sentence saying CLIENT's model is missing from MODELS, the (ID . NAME)
+pairs of the provider's catalog, or NIL when it is listed or MODELS is empty."
+  (let ((model (client-model client)))
+    (when (and models (not (find model models :key #'car :test #'string=)))
+      (format nil "The model ~A is not in ~A's model list, so it may have been withdrawn. Available: ~{~A~^, ~}. Choose one with /model."
+              model (client-base-url client) (mapcar #'car models)))))
+
+(defun note-unlisted-model (client output condition)
+  "CONDITION, a failed request's PROVIDER-ERROR, extended with a note when the
+HTTP status in curl OUTPUT suggests a bad model and the catalog lacks it."
+  (let* ((http-status (nth-value 1 (split-http-status output)))
+         (models (and (member http-status +model-check-statuses+ :test #'string=)
+                      (ignore-errors
+                        (multiple-value-bind (body catalog-status curl-status)
+                            (fetch-models-response (client-base-url client)
+                                                   (client-authorization-token client)
+                                                   :extra-headers (client-extra-headers client)
+                                                   :timeout 10)
+                          (and (success-status-p curl-status catalog-status)
+                               (model-catalog-from-body body))))))
+         (note (unlisted-model-note client models)))
+    (if note
+        (make-condition 'provider-error
+                        :message (format nil "~A~%~A"
+                                         (provider-error-message condition) note))
+        condition)))
+
 (defun post-provider (client request)
   (multiple-value-bind (arguments body streaming private-files)
       (provider-request-arguments client request)
@@ -747,8 +783,11 @@ asked for as a stream, and WIRE-API which stream it is."
                                      (note-request-piece stat (length chunk))
                                      (sse-reader-feed reader chunk handler))))
         (let ((response
-                (parse-provider-output output error-output status streaming
-                                       wire-api)))
+                (handler-case
+                    (parse-provider-output output error-output status streaming
+                                           wire-api)
+                  (provider-error (condition)
+                    (error (note-unlisted-model client output condition))))))
           (finish-request-stat stat response)
           response)))))
 
