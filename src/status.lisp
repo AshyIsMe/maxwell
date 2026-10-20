@@ -112,10 +112,29 @@ model's reply starts on a clean line."
   "The most characters a region row may hold at COLUMNS."
   (max 8 (- (max 10 (or columns 80)) 2)))
 
+(defun status-bar-rate ()
+  "The output tokens per second of the last finished request, as a short
+suffix for the status row, or NIL while none has been measured."
+  (let* ((stat (latest-request-stat))
+         (rate (and stat (request-stat-tokens-per-second stat))))
+    (when (and rate (plusp rate))
+      (format nil "~,1F tok/s" rate))))
+
 (defun status-bar-row (client columns)
-  "The status bar as one styled row, clipped to COLUMNS."
+  "The status bar as one styled row, clipped to COLUMNS. The rate of the last
+request, such as 106.5 tok/s, is pinned to the right edge."
   (let* ((text (status-bar-text client))
-         (limit (status-bar-limit columns)))
+         (limit (status-bar-limit columns))
+         (rate (status-bar-rate))
+         ;; One space at least between the text and the rate.
+         (room (and rate (- limit (length text) (length rate)))))
+    (when rate
+      (if (and room (>= room 2))
+          (setf text (concatenate 'string text
+                                  (make-string room :initial-element #\Space)
+                                  rate))
+          ;; No room to pin it; drop the rate rather than cut it in half.
+          (setf rate nil)))
     (when (> (length text) limit)
       (setf text (concatenate 'string (subseq text 0 (max 1 (1- limit))) "…")))
     (styled :dim text)))

@@ -400,6 +400,19 @@ fn main() {}") :rust))
       (maxwell::status-bar-show out 40 client)
       (check (string= "" (get-output-stream-string out)))
       (check (null maxwell::*status-bar-visible*)))
+    ;; The rate of the last request is pinned to the right edge, and left
+    ;; out rather than cut when there is no room for it.
+    (let ((maxwell::*request-stats*
+            (list (maxwell::make-request-stat :model "gpt-5"
+                                             :tokens-per-second 106.5))))
+      (check (string= "106.5 tok/s" (maxwell::status-bar-rate)))
+      (let* ((row (maxwell::status-bar-row client 60))
+             (limit (maxwell::status-bar-limit 60)))
+        (check (= limit (length row)))
+        (check (string= "106.5 tok/s"
+                        (subseq row (- (length row) 11))))
+        (check (char= #\Space (char row (- (length row) 12)))))
+      (check (not (search "tok/s" (maxwell::status-bar-row client 10)))))
     ;; /statusbar turns it off and on again.
     (let ((*standard-output* (make-string-output-stream)))
       (maxwell::status-bar-command "/statusbar off" client)

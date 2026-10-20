@@ -428,9 +428,11 @@ On an interactive terminal, a dim row sits directly above the prompt, showing
 which provider and model is answering and what Maxwell is doing: idle,
 thinking, responding, tooling, summarizing, or saving. Anything printed to the
 transcript clears the row first and the next prompt draws it again, so it never
-disturbs what is already on screen. `/statusbar` turns it off and on, and
-`/statusbar on` or `/statusbar off` says which. Redirected input and output have
-no status bar.
+disturbs what is already on screen. The output tokens per second of the last
+finished request are pinned to the row's right edge, as in `106.5 tok/s`; they
+are left out rather than cut when the terminal is too narrow. `/statusbar`
+turns it off and on, and `/statusbar on` or `/statusbar off` says which.
+Redirected input and output have no status bar.
 
 A provider that shows its thinking -- the Responses API's reasoning summaries,
 or Chat Completions' `reasoning_content` or `reasoning` -- has its reasoning
