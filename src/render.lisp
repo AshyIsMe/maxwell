@@ -62,6 +62,7 @@ older than the session.")
   (clear-row-cache)
   ;; The screen is new, so nothing of the status bar is left on it.
   (status-bar-forget)
+  (setf *live-reasoning* nil)
   (set-activity :idle))
 
 (defun toggle-tool-display ()
@@ -96,24 +97,6 @@ so a full row never wraps, or NIL (no wrapping) when STREAM is not a terminal."
        (1- (nth-value 1 (terminal-size)))))
 
 ;;; Rendering one entry into rows.
-
-(defun text-lines (text)
-  "TEXT's lines, without trailing blank lines."
-  (let ((lines (reverse (uiop:split-string text :separator '(#\Newline)))))
-    (loop while (and lines (zerop (length (string-trim '(#\Space #\Tab #\Return)
-                                                       (first lines)))))
-          do (pop lines))
-    (nreverse lines)))
-
-(defun clip-line (text limit)
-  "TEXT on one line of at most LIMIT characters: control characters become
-spaces, and a longer line is cut and ends with an ellipsis."
-  (let ((line (map 'string (lambda (character)
-                             (if (printable-char-p character) character #\Space))
-                   text)))
-    (if (> (length line) limit)
-        (concatenate 'string (subseq line 0 (max 0 (1- limit))) "…")
-        line)))
 
 (defun style-lines (face text)
   "TEXT with each line styled separately, so every line stands on its own."
@@ -261,6 +244,13 @@ whole result, highlighted as Lisp unless it is an error."
                             (highlight-code text :lisp)))
                       width "  └ " "    "))))
 
+(defun thinking-entry-rows (text width mode)
+  "Rows for a recorded thought: nothing by default, because the trace was
+already shown live while the model thought, and the whole trace in full mode,
+where Ctrl-T brings it back with the tool calls."
+  (when (eq mode :full)
+    (indent-rows (style-lines :thinking text) width "  " "  ")))
+
 (defun paired-echo-p (entries index)
   "True when entry INDEX is a result drawn as part of the tool call before it."
   (and (plusp index)
@@ -293,6 +283,7 @@ call and the result after it are drawn together, at the call."
              (:assistant (indent-rows (render-markdown text) width "" ""))
              (:steer (indent-rows (style-lines :steer text) width
                                   (format nil "~A " (styled :steer "steer>")) "       "))
+              (:thinking (thinking-entry-rows text width mode))
              (:status (indent-rows (style-lines (if (entry-ok-p entry) :dim :error) text)
                                    width "" ""))
              (t (indent-rows text width "" "")))))
@@ -323,16 +314,18 @@ they have been rendered before."
 
 (defun show-entry (entries index &optional (stream *standard-output*))
   "Print entry INDEX of ENTRIES as it arrives. A tool call waits for its
-result, and the pair is printed then."
+result, and the pair is printed then. An entry that draws no rows, such as a
+thought hidden by default, prints nothing at all."
   (let ((entry (aref entries index)))
     (unless (eq (entry-kind entry) :tool)
-      ;; The status bar and the steering line must go away before the
-      ;; transcript grows.
-      (status-bar-hide stream)
-      (when *input-hide* (funcall *input-hide*))
-      (write-rows (entry-rows entries (if (paired-echo-p entries index) (1- index) index)
-                              (live-width stream))
-                  stream))))
+      (let* ((index (if (paired-echo-p entries index) (1- index) index))
+             (rows (entry-rows entries index (live-width stream))))
+        (when (plusp (length rows))
+          ;; The status bar and the steering line must go away before the
+          ;; transcript grows.
+          (status-bar-hide stream)
+          (when *input-hide* (funcall *input-hide*))
+          (write-rows rows stream))))))
 
 (defun print-entry (entry &optional (stream *standard-output*))
   "Print ENTRY on its own, without recording it."

@@ -316,10 +316,13 @@ messages in the first element of REQUESTS."
     (check (maxwell::command-finished-p job))
     (check (not (probe-file (maxwell::command-job-input-path job)))))
   (check (= 1 (maxwell/json:get-key
-                (maxwell::parse-provider-output (format nil "{\"x\":1}~%200") "" 0 nil)
+                (maxwell::parse-provider-output
+                  (format nil "{\"x\":1}~%200") "" 0 nil :chat-completions)
                 "x")))
   (check (signals-error-p
-           (lambda () (maxwell::parse-provider-output (format nil "{}~%500") "" 0 nil)))))
+           (lambda ()
+             (maxwell::parse-provider-output
+               (format nil "{}~%500") "" 0 nil :chat-completions)))))
 
 (defun test-zoom-and-date ()
   (with-fresh-chat (chat)

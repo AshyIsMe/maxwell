@@ -409,9 +409,32 @@ fn main() {}") :rust))
       (maxwell::status-bar-command "/statusbar on" client)
       (check maxwell::*status-bar-enabled*))))
 
+(defun test-thinking-entry ()
+  (let ((maxwell::*color* nil)
+        (entries (entry-vector (maxwell::make-entry :thinking (format nil "step one~%step two")))))
+    ;; The trace was on screen while the model thought, so it is hidden by
+    ;; default; Ctrl-T brings the whole thing back with the tool calls.
+    (check (zerop (length (maxwell::entry-rows entries 0 60 :summary))))
+    (check (equal (coerce (maxwell::entry-rows entries 0 60 :full) 'list)
+                  '("  step one" "  step two" "")))
+    ;; A hidden trace prints nothing as it arrives.
+    (let ((maxwell::*session-entries* (maxwell::make-entry-vector))
+          (out (make-string-output-stream)))
+      (maxwell::record-entry :thinking "hidden" :show t :stream out)
+      (check (string= "" (get-output-stream-string out)))))
+  ;; What the model streams while it thinks is drawn above the status row.
+  (let ((maxwell::*color* nil)
+        (maxwell::*live-reasoning* (format nil "one~%two~%three")))
+    (check (equal (maxwell::live-reasoning-rows 60) '("one" "two" "three")))
+    (maxwell::note-live-reasoning " four")
+    (check (string= (format nil "one~%two~%three four") maxwell::*live-reasoning*))
+    (maxwell::hide-reasoning-trace)
+    (check (null maxwell::*live-reasoning*))))
+
 (defun run-ui-tests ()
   (test-status-bar)
   (test-tool-blocks)
+  (test-thinking-entry)
   (test-lazy-viewer)
   (test-recent-exchanges)
   (test-style)

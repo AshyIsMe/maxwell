@@ -24,6 +24,7 @@ after an image resumes with CONFIGURE-COLOR; never meaningful when saved.")
     (:code-inline . "36")
     (:bold . "1")
     (:italic . "3")
+    (:thinking . "2;3")
     ;; Syntax
     (:kw . "35")
     (:str . "32")
@@ -193,3 +194,21 @@ escape sequences and control characters are dropped."
         (when state (write-string (sgr "0") line))
         (push (get-output-stream-string line) lines)))
     (coerce (nreverse lines) 'vector)))
+
+(defun text-lines (text)
+  "TEXT's lines, without trailing blank lines."
+  (let ((lines (reverse (uiop:split-string text :separator '(#\Newline)))))
+    (loop while (and lines (zerop (length (string-trim '(#\Space #\Tab #\Return)
+                                                       (first lines)))))
+          do (pop lines))
+    (nreverse lines)))
+
+(defun clip-line (text limit)
+  "TEXT on one line of at most LIMIT characters: control characters become
+spaces, and a longer line is cut and ends with an ellipsis."
+  (let ((line (map 'string (lambda (character)
+                             (if (printable-char-p character) character #\Space))
+                   text)))
+    (if (> (length line) limit)
+        (concatenate 'string (subseq line 0 (max 0 (1- limit))) "…")
+        line)))

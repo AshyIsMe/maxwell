@@ -306,7 +306,10 @@ meanwhile."
                            (*input-poll* (lambda ()
                                            (service-steering-input session)
                                            (tick-compactor agent)))
-                           (*input-hide* (lambda () (steering-hide session))))
+                           (*input-hide* (lambda () (steering-hide session)))
+                           ;; A streamed reasoning trace shows while the model
+                           ;; thinks, and the prompt redraws it.
+                           (*reasoning-delta-function* #'note-live-reasoning))
                       (unwind-protect (run line :agent agent)
                         (steering-hide session)
                         ;; An unfinished steering line becomes the next prompt.
@@ -373,7 +376,8 @@ QUIET. True unless saving failed."
 /save PATH     save a separate resumable image and exit
 /quit          save the chat and exit (Ctrl-D too)
 Editing: Up/Down history; Ctrl-A/E line ends; Ctrl-U/W/K kill; Ctrl-Y yank.
-Ctrl-T expands or collapses tool calls; PgUp/PgDn browse the transcript.
+Ctrl-T expands or collapses tool calls and thinking traces; PgUp/PgDn
+browse the transcript.
 While the model works: type a line and press Enter to steer the model
 before its next request.")
 
@@ -402,7 +406,7 @@ before its next request.")
     (when (plusp start)
       (show-recent-exchanges (recent-log-entries *chat*) :count 2)))
   (record-entry :status
-                (format nil "Maxwell ~A — ~A~%Type /help for commands; PgUp/PgDn browse the transcript, Ctrl-T expands tool calls, Up/Down recall previous prompts."
+                (format nil "Maxwell ~A — ~A~%Type /help for commands; PgUp/PgDn browse the transcript, Ctrl-T expands tool calls and thoughts, Up/Down recall previous prompts."
                         (client-model (agent-client *agent*))
                         (namestring (agent-workspace *agent*)))
                 :show t)

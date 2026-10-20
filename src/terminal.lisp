@@ -319,15 +319,11 @@ no key arrives, so background work such as compaction continues."
   (prompt-editor-text (steering-session-editor session)))
 
 (defun steering-show (session)
-  "Draw the steering prompt if it is not already on screen, and keep the status
-bar's text current while it is."
+  "Draw the steering prompt, and with it the region above: the status row and,
+while the model thinks, the live reasoning trace."
   (let ((editor (steering-session-editor session)))
-    (if (steering-session-shown session)
-        (status-bar-refresh (prompt-editor-output editor)
-                            (prompt-editor-columns editor) (session-client))
-        (progn
-          (editor-redraw editor)
-          (setf (steering-session-shown session) t)))))
+    (editor-redraw editor)
+    (setf (steering-session-shown session) t)))
 
 (defun steering-hide (session)
   "Erase the steering prompt so other output starts on a clean line."

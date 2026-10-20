@@ -130,15 +130,53 @@ client keeps it and no other request field is disturbed."
             (and (plusp (length stderr)) stderr))))
 
 (defun chat-message (message)
-  "Copy MESSAGE while removing Maxwell's provider-private bookkeeping keys."
+  "Copy MESSAGE while removing Maxwell's provider-private bookkeeping keys and
+any reasoning the provider sent, which is shown but never sent back."
   (let ((copy (make-hash-table :test #'equal)))
     (maphash (lambda (key value)
                (unless (and (stringp key)
-                            (>= (length key) 9)
-                            (string= key "_maxwell_" :end1 9 :end2 9))
+                            (or (and (>= (length key) 9)
+                                     (string= key "_maxwell_" :end1 9 :end2 9))
+                                (member key '("reasoning" "reasoning_content")
+                                        :test #'string=)))
                  (setf (gethash key copy) value)))
              message)
     copy))
+
+;;; Reasoning traces. A model that shows its thinking names it differently on
+;;; each wire: the Responses API streams reasoning summaries, while
+;;; Chat Completions providers send REASONING_CONTENT or REASONING. Maxwell
+;;; carries whatever it receives under one private key on the assistant
+;;; message, shows it, and never sends it back.
+
+(defparameter +reasoning-key+ "_maxwell_reasoning"
+  "Where an assistant message keeps the reasoning its provider sent.")
+
+(defvar *reasoning-delta-function* nil
+  "When non-NIL, a function called with each piece of the model's reasoning as
+it streams in, so the prompt can show it while the model thinks.")
+
+(defun note-reasoning-delta (text)
+  "Tell the live trace about one streamed piece of TEXT, if any is listening."
+  (when (and *reasoning-delta-function* (stringp text) (plusp (length text)))
+    (funcall *reasoning-delta-function* text))
+  text)
+
+(defun message-reasoning (message)
+  "The reasoning text MESSAGE carries, or NIL."
+  (let ((text (get-key message +reasoning-key+)))
+    (and (stringp text) (plusp (length text)) text)))
+
+(defun normalize-message-reasoning (message)
+  "Move any reasoning a provider put on MESSAGE under +REASONING-KEY+, so it
+is shown and never sent back in the next request."
+  (let ((text (or (get-key message "reasoning_content")
+                  (get-key message "reasoning"))))
+    (when (and (stringp text) (plusp (length text)))
+      (setf (gethash +reasoning-key+ message) text))
+    (remhash "reasoning_content" message)
+    (remhash "reasoning" message))
+  message)
 
 (defun apply-effort (client request)
   "Send CLIENT's thinking effort in REQUEST's provider spelling: a reasoning
@@ -161,9 +199,12 @@ of a reasoning object the caller sent are kept."
 (defun chat-request-object (client messages tools)
   (let ((request (copy-object (client-request-fields client))))
     ;; Core agent state always wins over optional provider-specific fields.
+    ;; The reply is streamed so that a reasoning trace can be shown while the
+    ;; model thinks; a provider that ignores STREAM still answers in one piece.
     (setf (gethash "model" request) (client-model client)
           (gethash "messages" request) (map 'vector #'chat-message messages)
-          (gethash "tools" request) tools)
+          (gethash "tools" request) tools
+          (gethash "stream" request) t)
     (apply-effort client request)))
 
 (defun response-tool (tool)
@@ -210,6 +251,22 @@ of a reasoning object the caller sent are kept."
                          when (string= (get-key part "type" "") "output_text")
                            do (write-string (get-key part "text" "") stream)))))))
 
+(defun responses-reasoning-text (output)
+  "The reasoning summaries carried by the Responses OUTPUT items, or an
+empty string when there are none."
+  (let ((text
+          (with-output-to-string (stream)
+            (loop for item across output
+                  when (string= (get-key item "type" "") "reasoning")
+                    do (let ((summary (get-key item "summary")))
+                         (when (vectorp summary)
+                           (loop for part across summary
+                                 when (string= (get-key part "type" "")
+                                               "summary_text")
+                                   do (write-string (get-key part "text" "") stream)
+                                      (write-string (format nil "~%~%") stream))))))))
+    (string-trim '(#\Space #\Tab #\Newline #\Return) text)))
+
 (defun responses-as-chat-response (response)
   (let* ((output (get-key response "output" #()))
          (calls
@@ -222,8 +279,11 @@ of a reasoning object the caller sent are kept."
                                           "name" (get-key item "name")
                                           "arguments" (get-key item "arguments" "{}")))))
          (message (json-object "role" "assistant"
-                               "content" (response-output-text output))))
+                               "content" (response-output-text output)))
+         (reasoning (responses-reasoning-text output)))
     (setf (gethash "_maxwell_responses_output" message) output)
+    (when (plusp (length reasoning))
+      (setf (gethash +reasoning-key+ message) reasoning))
     (when calls
       (setf (gethash "tool_calls" message) (coerce calls 'vector)))
     (json-object "choices" (json-array (json-object "message" message)))))
@@ -235,9 +295,17 @@ of a reasoning object the caller sent are kept."
                   "responses"
                   "chat/completions"))))
 
-(defun streaming-responses-request-p (client request)
-  (and (eq (client-wire-api client) :responses)
-       (eq (get-key request "stream") t)))
+(defun stream-requested-p (request)
+  "True when REQUEST asks the provider to stream its reply."
+  (eq (get-key request "stream") t))
+
+(defun sse-body-p (body)
+  "True when BODY looks like a Server-Sent Events stream rather than JSON."
+  (let* ((start (string-trim '(#\Space #\Tab #\Newline #\Return) body))
+         (colon (position #\: start)))
+    (and colon
+         (member (subseq start 0 colon) '("data" "event") :test #'string=))))
+
 
 (defun strip-trailing-return (line)
   (if (and (plusp (length line))
@@ -342,6 +410,152 @@ of a reasoning object the caller sent are kept."
        (error 'provider-error
               :message "Provider Responses stream ended without response.completed.")))))
 
+;;; A streamed reply arrives in pieces, so the reasoning can be shown while the
+;;; model is still thinking. SSE-READER-FEED parses whatever has arrived so
+;;; far; once the stream ends the whole reply is parsed again, in one piece, by
+;;; DECODE-CHAT-SSE or DECODE-RESPONSES-SSE.
+
+(defstruct (sse-reader (:constructor %make-sse-reader))
+  "A Server-Sent Events stream read in pieces: the tail of an unfinished line
+and the event being assembled."
+  (rest "")
+  (event nil)
+  (data '()))
+
+(defun sse-reader-feed (reader chunk handler)
+  "Read CHUNK, the newest piece of a stream, calling HANDLER with the name and
+data of each complete event."
+  (let* ((text (concatenate 'string (sse-reader-rest reader) chunk))
+         (lines (uiop:split-string text :separator '(#\Newline)))
+         (complete (butlast lines)))
+    (setf (sse-reader-rest reader) (or (car (last lines)) ""))
+    (dolist (raw complete)
+      (let ((line (strip-trailing-return raw)))
+        (cond
+          ((zerop (length line))
+           (when (sse-reader-data reader)
+             (funcall handler (sse-reader-event reader)
+                      (format nil "~{~A~^~%~}" (nreverse (sse-reader-data reader))))
+             (setf (sse-reader-data reader) '()
+                   (sse-reader-event reader) nil)))
+          ((char= (char line 0) #\:))
+          (t
+           (let ((colon (position #\: line)))
+             (when colon
+               (let ((field (subseq line 0 colon))
+                     (value (sse-field-value line colon)))
+                 (cond ((string= field "event")
+                        (setf (sse-reader-event reader) value))
+                       ((string= field "data")
+                        (push value (sse-reader-data reader)))))))))))))
+
+(defun responses-sse-reasoning-handler (name data)
+  "Show the reasoning that a Responses SSE event carries."
+  (declare (ignore name))
+  (handler-case
+      (let* ((event (decode data))
+             (type (get-key event "type")))
+        (when (and (stringp type)
+                   (member type '("response.reasoning_summary_text.delta"
+                                  "response.reasoning_text.delta")
+                           :test #'string=))
+          (note-reasoning-delta (get-key event "delta"))))
+    (error () nil)))
+
+(defun chat-sse-reasoning-handler (name data)
+  "Show the reasoning that a Chat Completions SSE event carries."
+  (declare (ignore name))
+  (handler-case
+      (let* ((event (decode data))
+             (choices (get-key event "choices"))
+             (delta (and (vectorp choices) (plusp (length choices))
+                         (get-key (aref choices 0) "delta"))))
+        (when (hash-table-p delta)
+          (note-reasoning-delta (or (get-key delta "reasoning_content")
+                                    (get-key delta "reasoning")))))
+    (error () nil)))
+
+(defun sse-reasoning-handler (wire-api)
+  "The function that shows the reasoning a WIRE-API stream carries."
+  (if (eq wire-api :responses)
+      #'responses-sse-reasoning-handler
+      #'chat-sse-reasoning-handler))
+
+(defun decode-chat-sse (body)
+  "Return the Chat Completions response carried by a streaming BODY, rebuilt
+from its deltas: the content, the reasoning, and the tool calls."
+  (let ((content (make-string-output-stream))
+        (reasoning (make-string-output-stream))
+        (calls (make-hash-table))
+        (highest -1)
+        (failure nil))
+    (labels ((merge-call (call)
+               "Add one streamed tool-call delta to CALLS, by index."
+               (let* ((index (or (get-key call "index") 0))
+                      (existing (gethash index calls)))
+                 (unless existing
+                   (setf existing (json-object
+                                    "id" (get-key call "id")
+                                    "type" "function"
+                                    "function" (json-object "name" ""
+                                                             "arguments" ""))
+                         (gethash index calls) existing
+                         highest (max highest index)))
+                 (let ((function (get-key call "function"))
+                       (target (get-key existing "function")))
+                   (when (hash-table-p function)
+                     (let ((name (get-key function "name"))
+                           (arguments (get-key function "arguments")))
+                       (when (and (stringp name) (plusp (length name))
+                                  (zerop (length (get-key target "name"))))
+                         (setf (gethash "name" target) name))
+                       (when (stringp arguments)
+                         (setf (gethash "arguments" target)
+                               (concatenate 'string
+                                            (get-key target "arguments")
+                                            arguments))))))))
+             (handle-event (event)
+               "Fold one decoded stream event into the reply being rebuilt."
+               (let ((error-object (get-key event "error"))
+                     (choices (get-key event "choices")))
+                 (when (hash-table-p error-object)
+                   (setf failure (or (get-key error-object "message")
+                                     "stream error")))
+                 (when (and (vectorp choices) (plusp (length choices)))
+                   (let* ((choice (aref choices 0))
+                          (delta (get-key choice "delta")))
+                     (when (hash-table-p delta)
+                       (let ((text (get-key delta "content"))
+                             (thought (or (get-key delta "reasoning_content")
+                                          (get-key delta "reasoning")))
+                             (tool-calls (get-key delta "tool_calls")))
+                         (when (stringp text) (write-string text content))
+                         (when (stringp thought) (write-string thought reasoning))
+                         (when (vectorp tool-calls)
+                           (loop for call across tool-calls do (merge-call call))))))))))
+      (sse-reader-feed
+        (%make-sse-reader) body
+        (lambda (name data)
+          (declare (ignore name))
+          (unless (string= data "[DONE]")
+            (let ((event (ignore-errors (decode data))))
+              (when (hash-table-p event) (handle-event event)))))))
+    (when failure
+      (error 'provider-error
+             :message (format nil "Provider stream failed: ~A" failure)))
+    (let* ((thought (get-output-stream-string reasoning))
+           (message (json-object "role" "assistant"
+                                 "content" (get-output-stream-string content)))
+           (tool-calls (loop for index from 0 to highest
+                             for call = (gethash index calls)
+                             when call collect call)))
+      (when (plusp (length thought))
+        (setf (gethash +reasoning-key+ message) thought))
+      (when tool-calls
+        (setf (gethash "tool_calls" message) (coerce tool-calls 'vector)))
+      (json-object "choices" (json-array (json-object "message" message))))))
+
+
 (defun client-authorization-token (client)
   (case (client-auth-provider client)
     (:openai (openai-access-token))
@@ -439,7 +653,7 @@ exit status, and curl's error output."
   "The curl arguments and request body that POST REQUEST to CLIENT's provider.
 The third value is true when the reply is a Responses API event stream; the
 fourth lists the private files, holding the credential, that the arguments read."
-  (let ((streaming (streaming-responses-request-p client request))
+  (let ((streaming (stream-requested-p request))
         (url (provider-url client)))
     (multiple-value-bind (authorization private-files)
         (bearer-header-arguments (client-authorization-token client))
@@ -459,34 +673,46 @@ fourth lists the private files, holding the credential, that the arguments read.
         streaming
         private-files))))
 
-(defun parse-provider-output (output error-output status streaming)
+(defun parse-provider-output (output error-output status streaming wire-api)
   "Decode the reply curl printed for a provider request, or signal a
-PROVIDER-ERROR. STATUS is curl's exit status."
+PROVIDER-ERROR. STATUS is curl's exit status; STREAMING says the reply was
+asked for as a stream, and WIRE-API which stream it is."
   (multiple-value-bind (response-body http-status) (split-http-status output)
     (unless (success-status-p status http-status)
       (error 'provider-error
              :message (response-error-message response-body
                                               (if (zerop status) http-status status)
                                               error-output)))
-    (handler-case (if streaming
-                      (decode-responses-sse response-body)
-                      (decode response-body))
-      (error (condition)
-        (when (typep condition 'provider-error) (error condition))
-        (error 'provider-error
-               :message (format nil "Provider returned invalid ~A: ~A~%~A"
-                                (if streaming "SSE" "JSON")
-                                condition response-body))))))
+    (let ((streamed-p (and streaming (sse-body-p response-body))))
+      (handler-case
+          (cond (streamed-p
+                 (if (eq wire-api :responses)
+                     (decode-responses-sse response-body)
+                     (decode-chat-sse response-body)))
+                (t (decode response-body)))
+        (error (condition)
+          (when (typep condition 'provider-error) (error condition))
+          (error 'provider-error
+                 :message (format nil "Provider returned invalid ~A: ~A~%~A"
+                                  (if streamed-p "SSE" "JSON")
+                                  condition response-body)))))))
 
 (defun post-provider (client request)
   (multiple-value-bind (arguments body streaming private-files)
       (provider-request-arguments client request)
     ;; The request body goes to the child's standard input. At the prompt the
     ;; child runs asynchronously so the user can still browse the transcript
-    ;; and queue steering prompts while the model works.
-    (multiple-value-bind (output error-output status)
-        (run-command arguments :input body :private-files private-files)
-      (parse-provider-output output error-output status streaming))))
+    ;; and queue steering prompts while the model works; a streamed reply is
+    ;; shown as it arrives, so the model's reasoning appears while it thinks.
+    (let* ((wire-api (client-wire-api client))
+           (reader (and streaming (%make-sse-reader)))
+           (handler (and reader (sse-reasoning-handler wire-api))))
+      (multiple-value-bind (output error-output status)
+          (run-command arguments :input body :private-files private-files
+                       :watch (and reader
+                                   (lambda (chunk)
+                                     (sse-reader-feed reader chunk handler))))
+        (parse-provider-output output error-output status streaming wire-api)))))
 
 (defun require-model (client)
   (when (zerop (length (client-model client)))
@@ -528,7 +754,8 @@ Signals PROVIDER-ERROR when the request failed."
   (let ((response (multiple-value-bind (output error-output status)
                       (finish-command (provider-job-command job))
                     (parse-provider-output output error-output status
-                                           (provider-job-streaming job)))))
+                                           (provider-job-streaming job)
+                                           (provider-job-wire-api job)))))
     (if (eq (provider-job-wire-api job) :responses)
         (responses-as-chat-response response)
         response)))

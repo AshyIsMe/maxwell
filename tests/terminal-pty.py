@@ -90,7 +90,8 @@ try:
     assert b'\r\x1b[2K\x1b[2mopenai/no model  idle\x1b[0m' in session.seen, session.seen
     marked = len(session.seen)
     session.send(b'/statusbar off\r')
-    session.expect(b'\x1b[A\r\x1b[2K')
+    # The cursor backs up over the region and clears it to the end of screen.
+    session.expect(b'\x1b[1A\r\x1b[J')
     assert b'idle' not in session.seen[marked:], session.seen[marked:]
     session.send(b'/statusbar on\r')
     session.expect(b'openai/no model  idle')

@@ -126,16 +126,32 @@ output, and its exit status."
   (delete-command-files job)
   nil)
 
-(defun run-command-asynchronously (arguments input private-files)
-  "Run ARGUMENTS with INPUT on standard input, servicing keystrokes meanwhile."
+(defun command-output-so-far (job)
+  "The text JOB's process has written so far, or NIL when it cannot be read
+yet: the file is not there, or a partial character is still arriving."
+  (handler-case
+      (let ((path (command-job-output-path job)))
+        (when (probe-file path) (uiop:read-file-string path)))
+    (error () nil)))
+
+(defun run-command-asynchronously (arguments input private-files watch)
+  "Run ARGUMENTS with INPUT on standard input, servicing keystrokes meanwhile.
+WATCH, when non-NIL, is called with each new piece of the command's output as
+it arrives, so a streamed reply can be shown while it is still coming."
   (unwind-protect
        (let ((job (start-command arguments :input input
                                            :private-files private-files))
-             (finished nil))
+             (finished nil)
+             (seen 0))
          (unwind-protect
               (progn
                 (loop until (command-finished-p job)
-                      do (funcall *input-poll*)
+                      do (when watch
+                           (let ((text (command-output-so-far job)))
+                             (when (and text (> (length text) seen))
+                               (funcall watch (subseq text seen))
+                               (setf seen (length text)))))
+                         (funcall *input-poll*)
                          (sleep 0.02))
                 (multiple-value-prog1 (finish-command job)
                   (setf finished t)))
@@ -143,10 +159,12 @@ output, and its exit status."
     ;; The input line must go away before the caller prints anything else.
     (when *input-hide* (funcall *input-hide*))))
 
-(defun run-command (arguments &key input private-files)
+(defun run-command (arguments &key input private-files watch)
   "Run ARGUMENTS with INPUT on its standard input. Returns the command's
 output, its error output, and its exit status. PRIVATE-FILES are (PATH . TEXT)
-pairs that exist, owner-only, only while the command runs."
+pairs that exist, owner-only, only while the command runs. WATCH, when non-NIL,
+is called with each new piece of the output while an asynchronous command
+runs."
   (if (null *input-poll*)
       (unwind-protect
            (progn
@@ -158,4 +176,4 @@ pairs that exist, owner-only, only while the command runs."
                                    :ignore-error-status t)
                (values output error-output status)))
         (delete-private-files private-files))
-      (run-command-asynchronously arguments input private-files)))
+      (run-command-asynchronously arguments input private-files watch)))

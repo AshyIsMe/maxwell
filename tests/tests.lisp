@@ -718,12 +718,90 @@
       (dolist (path (list session auth))
         (when (probe-file path) (delete-file path))))))
 
+(defun test-reasoning-streams ()
+  (flet ((sse (&rest events)
+           (with-output-to-string (out)
+             (dolist (event events) (format out "data: ~A~%~%" event)))))
+    ;; A streamed Chat Completions reply is rebuilt from its deltas, with the
+    ;; reasoning the provider sent.
+    (let* ((body (sse "{\"choices\":[{\"delta\":{\"reasoning_content\":\"Thin\"}}]}"
+                      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"king\"}}]}"
+                      "{\"choices\":[{\"delta\":{\"content\":\"Hi \"}}]}"
+                      "{\"choices\":[{\"delta\":{\"content\":\"there\"},\"finish_reason\":\"stop\"}]}"
+                      "[DONE]"))
+           (response (maxwell::decode-chat-sse body))
+           (message (maxwell/json:get-key
+                      (aref (maxwell/json:get-key response "choices") 0) "message")))
+      (check (string= "Hi there" (maxwell/json:get-key message "content")))
+      (check (string= "Thinking" (maxwell::message-reasoning message))))
+    ;; Tool calls arrive in pieces and are joined by index.
+    (let* ((body (sse "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"common_lisp\",\"arguments\":\"{\\\"code\\\":\"}}]}}]}"
+                      "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"(+ 1 2)\\\"}\"}}]}}]}"))
+           (response (maxwell::decode-chat-sse body))
+           (message (maxwell/json:get-key
+                      (aref (maxwell/json:get-key response "choices") 0) "message"))
+           (function (maxwell/json:get-key
+                       (aref (maxwell/json:get-key message "tool_calls") 0) "function")))
+      (check (string= "common_lisp" (maxwell/json:get-key function "name")))
+      (check (string= "{\"code\":\"(+ 1 2)\"}"
+                      (maxwell/json:get-key function "arguments"))))
+    ;; The live trace hears reasoning as it arrives, even split mid-event.
+    (let* ((seen '())
+           (maxwell::*reasoning-delta-function* (lambda (text) (push text seen)))
+          (reader (maxwell::%make-sse-reader))
+          (handler (maxwell::sse-reasoning-handler :chat-completions)))
+      (dolist (chunk '("data: {\"choices\":[{\"delta\":{\"reason"
+                       "ing_content\":\"A\"}}]}"))
+        (maxwell::sse-reader-feed reader chunk handler))
+      (maxwell::sse-reader-feed
+        reader
+        (format nil "~%~%data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"B\"}}]}~%~%")
+        handler)
+      (check (equal '("A" "B") (nreverse seen))))
+    ;; Responses reasoning summaries ride on the message and reach the trace.
+    (let* ((reasoning (maxwell/json:json-object
+                        "type" "reasoning"
+                        "summary" (maxwell/json:json-array
+                                     (maxwell/json:json-object
+                                       "type" "summary_text" "text" "Let me think."))))
+           (response (maxwell::responses-as-chat-response
+                       (maxwell/json:json-object
+                         "output" (maxwell/json:json-array reasoning))))
+           (message (maxwell/json:get-key
+                      (aref (maxwell/json:get-key response "choices") 0) "message")))
+      (check (string= "Let me think." (maxwell::message-reasoning message))))
+    (let* ((seen '())
+           (maxwell::*reasoning-delta-function* (lambda (text) (push text seen))))
+      (maxwell::responses-sse-reasoning-handler
+        "response.reasoning_summary_text.delta"
+        "{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"hmm\"}")
+      (check (equal '("hmm") seen)))
+    ;; Reasoning a provider put on a message is never sent back.
+    (let ((message (maxwell/json:json-object "role" "assistant" "content" "x"
+                                             "reasoning_content" "secret")))
+      (maxwell::normalize-message-reasoning message)
+      (check (string= "secret" (maxwell::message-reasoning message)))
+      (check (not (nth-value 1 (gethash "reasoning_content"
+                                        (maxwell::chat-message message))))))
+    ;; Chat Completions asks for a stream, and an SSE body is told from JSON.
+    (check (eq t (maxwell/json:get-key
+                   (maxwell::chat-request-object (maxwell:make-client :model "m")
+                                                 #() #())
+                   "stream")))
+    (check (maxwell::sse-body-p (format nil "data: {}~%~%")))
+    (check (not (maxwell::sse-body-p "{\"choices\":[]}")))
+    (check (not (maxwell::sse-body-p "")))))
+
 (defun run-tests ()
   ;; Tests may be run by the live agent through COMMON_LISP.
   (let ((maxwell:*agent* nil)
         ;; Nor touch the live session's transcript or display settings.
         (maxwell::*session-entries* (maxwell::make-entry-vector))
         (maxwell::*tool-display* :summary)
+        (maxwell::*live-reasoning* nil)
+        (maxwell::*status-bar-extra-rows* 0)
+        (maxwell::*status-bar-drawn-rows* '())
+        (maxwell::*reasoning-delta-function* nil)
         (maxwell::*older-entries-function* nil)
         (maxwell::*color* nil)
         (maxwell::*pending-image* nil)
@@ -750,6 +828,7 @@
     (test-nested-agent-run)
     (test-responses-adapter)
     (test-responses-sse)
+    (test-reasoning-streams)
     (test-auth-encoding)
     (test-openai-client-contract)
     (test-model-catalog)

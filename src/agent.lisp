@@ -52,16 +52,22 @@
          (message (and choice (get-key choice "message"))))
     (unless (hash-table-p message)
       (error 'provider-error :message "Provider response has no assistant message."))
-    message))
+    ;; A provider that shows its thinking names it differently on each wire.
+    (normalize-message-reasoning message)))
 
 (defun invoke-model (agent)
   (set-activity :thinking)
-  (multiple-value-prog1
-      (if (agent-model-function agent)
-          (funcall (agent-model-function agent) (wire-messages agent)
-                   (json-array (common-lisp-tool)))
-          (call-provider (agent-client agent) (wire-messages agent)
-                         (json-array (common-lisp-tool))))
+  ;; The live reasoning trace belongs to this request alone.
+  (hide-reasoning-trace)
+  (unwind-protect
+       (if (agent-model-function agent)
+           (funcall (agent-model-function agent) (wire-messages agent)
+                    (json-array (common-lisp-tool)))
+           (call-provider (agent-client agent) (wire-messages agent)
+                          (json-array (common-lisp-tool))))
+    ;; The reply arrived, or the request failed: take the trace away, since the
+    ;; model is done thinking.
+    (hide-reasoning-trace)
     (set-activity :responding)))
 
 ;;; Logging
@@ -303,6 +309,10 @@ final reply."
              (message (assistant-message response))
              (tool-calls (get-key message "tool_calls"))
              (content (message-content message)))
+        ;; What the model thought is recorded, but hidden until Ctrl-T: it was
+        ;; on screen while the model thought, and it is not part of the view.
+        (let ((reasoning (message-reasoning message)))
+          (when reasoning (record-entry :thinking reasoning :show *show-entries*)))
         (setf (agent-history agent)
               (append (agent-history agent) (list message)))
         (when (plusp (length content))

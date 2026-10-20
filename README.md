@@ -270,9 +270,11 @@ Terminal behaviour is covered by pty tests that drive the built executable:
 `python3 tests/terminal-pty.py` for editing, history, Ctrl-T, colour, and
 settings restoration; `python3 tests/terminal-pty-steering.py` for browsing and
 steering during a request (it serves a deliberately slow fake provider on a
-local port); and `python3 tests/checkpoint-pty.py` for saving, restarting, the
-lock, and moving the chat between builds. All of them keep their images,
-sessions, and logins in a temporary directory.
+local port); `python3 tests/thinking-pty.py` for a provider that streams
+its reasoning, which is served on a local port too; and
+`python3 tests/checkpoint-pty.py` for saving, restarting, the lock, and moving
+the chat between builds. All of them keep their images, sessions, and logins in
+a temporary directory.
 
 ### Vendored libraries
 
@@ -385,8 +387,8 @@ inspect and adapt itself using its own Lisp tool.
 
 Tool calls are drawn as a one-line summary with the last lines of their
 result; a green or red bullet shows whether the call succeeded. **Ctrl-T**
-switches every tool call between that summary and the full code and result,
-and redraws the screen, at the prompt, while the model works, or in the
+switches every tool call between that summary and the full code and result, and
+each recorded thinking trace between hidden and shown, then redraws the screen, at the prompt, while the model works, or in the
 viewer. Replies are rendered as light markdown, and code in them is
 highlighted (Common Lisp, Rust, JavaScript/TypeScript, C/C++, Go, Java,
 Python, shell, JSON, TOML/YAML, diff).
@@ -410,7 +412,7 @@ The viewer shows conversation messages, not every CLI status line, and terminal
 dimensions are read when it opens. A resumed chat starts by showing its last
 two exchanges, dimmed.
 
-### The status bar
+### The status bar and the thinking trace
 
 On an interactive terminal, a dim row sits directly above the prompt, showing
 which provider and model is answering and what Maxwell is doing: idle,
@@ -419,6 +421,16 @@ transcript clears the row first and the next prompt draws it again, so it never
 disturbs what is already on screen. `/statusbar` turns it off and on, and
 `/statusbar on` or `/statusbar off` says which. Redirected input and output have
 no status bar.
+
+A provider that shows its thinking -- the Responses API's reasoning summaries,
+or Chat Completions' `reasoning_content` or `reasoning` -- has its reasoning
+streamed into dim rows just above that one while the model thinks, and taken
+away the moment the reply arrives. The trace is a live view, not part of the
+conversation: it is never added to the view the model reads, and never sent
+back to the provider. At the prompt it is recorded so that **Ctrl-T** brings it
+back, together with the expanded tool calls, and Ctrl-T out of full mode hides
+it again. Chat Completions requests are streamed so this works there too; a
+provider that ignores `stream` is answered in one piece as before.
 
 ### Steering the model while it works
 
