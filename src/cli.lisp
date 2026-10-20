@@ -370,6 +370,7 @@ QUIET. True unless saving failed."
 /effort LEVEL  set it: none, minimal, low, medium, or high
 /statusbar     show or hide the status bar above the prompt
 /memory        show the chat's size, summaries, and compactor jobs
+/stats         show timing and token counts for recent model requests
 /import PATH   read a file into memory as a note
 /checkpoint    save the chat to the global image and keep going
 /reload        load Maxwell's source into this session, then save
@@ -455,6 +456,8 @@ before its next request.")
         ((command-p line "/memory")
          (status "~A~%image: ~A" (memory-report *chat*)
                  (if *checkpoint-path* (native *checkpoint-path*) "none (ephemeral)")))
+        ((command-p line "/stats")
+         (status "~A" (request-stats-report)))
         ((command-argument line "/import ")
          (let ((path (command-argument line "/import ")))
            (if (zerop (length path))

@@ -204,7 +204,11 @@ of a reasoning object the caller sent are kept."
     (setf (gethash "model" request) (client-model client)
           (gethash "messages" request) (map 'vector #'chat-message messages)
           (gethash "tools" request) tools
-          (gethash "stream" request) t)
+          (gethash "stream" request) t
+          ;; Ask for a usage report at the end of the stream, so token counts
+          ;; are measured rather than estimated.
+          (gethash "stream_options" request)
+          (json-object "include_usage" t))
     (apply-effort client request)))
 
 (defun response-tool (tool)
@@ -286,7 +290,13 @@ empty string when there are none."
       (setf (gethash +reasoning-key+ message) reasoning))
     (when calls
       (setf (gethash "tool_calls" message) (coerce calls 'vector)))
-    (json-object "choices" (json-array (json-object "message" message)))))
+    (let ((chat (json-object "choices"
+                             (json-array (json-object "message" message)))))
+      ;; Keep the Responses usage so the request can be measured like a
+      ;; Chat Completions one.
+      (let ((usage (get-key response "usage")))
+        (when (hash-table-p usage) (setf (gethash "usage" chat) usage)))
+      chat)))
 
 (defun provider-url (client)
   (or (client-endpoint client)
@@ -300,11 +310,24 @@ empty string when there are none."
   (eq (get-key request "stream") t))
 
 (defun sse-body-p (body)
-  "True when BODY looks like a Server-Sent Events stream rather than JSON."
-  (let* ((start (string-trim '(#\Space #\Tab #\Newline #\Return) body))
-         (colon (position #\: start)))
-    (and colon
-         (member (subseq start 0 colon) '("data" "event") :test #'string=))))
+  "True when BODY looks like a Server-Sent Events stream rather than JSON.
+The first line may be a comment (a lone colon, as in a keep-alive), which is
+skipped before the first data or event field is looked for."
+  (loop with start = 0
+        for end = (position #\Newline body :start start)
+        for line = (strip-trailing-return
+                     (string-trim '(#\Space #\Tab #\Return)
+                                  (subseq body start end)))
+        for colon = (position #\: line)
+        do (cond ((zerop (length line)) nil)
+                 ((and colon (zerop colon)) nil)
+                 ((and colon (member (subseq line 0 colon) '("data" "event")
+                                     :test #'string=))
+                  (return t))
+                 (t (return nil)))
+        while end
+        do (setf start (1+ end))
+        finally (return nil)))
 
 
 (defun strip-trailing-return (line)
@@ -488,6 +511,7 @@ from its deltas: the content, the reasoning, and the tool calls."
         (reasoning (make-string-output-stream))
         (calls (make-hash-table))
         (highest -1)
+        (usage nil)
         (failure nil))
     (labels ((merge-call (call)
                "Add one streamed tool-call delta to CALLS, by index."
@@ -518,6 +542,9 @@ from its deltas: the content, the reasoning, and the tool calls."
                "Fold one decoded stream event into the reply being rebuilt."
                (let ((error-object (get-key event "error"))
                      (choices (get-key event "choices")))
+                 ;; The closing chunk carries the usage; it may have no choices.
+                 (let ((seen-usage (get-key event "usage")))
+                   (when (hash-table-p seen-usage) (setf usage seen-usage)))
                  (when (hash-table-p error-object)
                    (setf failure (or (get-key error-object "message")
                                      "stream error")))
@@ -553,7 +580,10 @@ from its deltas: the content, the reasoning, and the tool calls."
         (setf (gethash +reasoning-key+ message) thought))
       (when tool-calls
         (setf (gethash "tool_calls" message) (coerce tool-calls 'vector)))
-      (json-object "choices" (json-array (json-object "message" message))))))
+      (let ((response (json-object "choices"
+                                   (json-array (json-object "message" message)))))
+        (when usage (setf (gethash "usage" response) usage))
+        response))))
 
 
 (defun client-authorization-token (client)
@@ -706,13 +736,21 @@ asked for as a stream, and WIRE-API which stream it is."
     ;; shown as it arrives, so the model's reasoning appears while it thinks.
     (let* ((wire-api (client-wire-api client))
            (reader (and streaming (%make-sse-reader)))
-           (handler (and reader (sse-reasoning-handler wire-api))))
+           (handler (and reader (sse-reasoning-handler wire-api)))
+           ;; Measure the request: the time to the first streamed piece, the
+           ;; total time, and the token counts the provider reports.
+           (stat (request-stat-begin (client-model client) wire-api)))
       (multiple-value-bind (output error-output status)
           (run-command arguments :input body :private-files private-files
                        :watch (and reader
                                    (lambda (chunk)
+                                     (note-request-piece stat (length chunk))
                                      (sse-reader-feed reader chunk handler))))
-        (parse-provider-output output error-output status streaming wire-api)))))
+        (let ((response
+                (parse-provider-output output error-output status streaming
+                                       wire-api)))
+          (finish-request-stat stat response)
+          response)))))
 
 (defun require-model (client)
   (when (zerop (length (client-model client)))

@@ -792,6 +792,63 @@
     (check (not (maxwell::sse-body-p "{\"choices\":[]}")))
     (check (not (maxwell::sse-body-p "")))))
 
+(defun test-request-stats ()
+  ;; A measured request records latency, total time, and the tokens the
+  ;; provider reported; a streamed reply carries its usage in the final chunk.
+  (flet ((sse (&rest events)
+           (with-output-to-string (out)
+             (dolist (event events)
+               (format out "data: ~A~%~%" event)))))
+    (let* ((body (sse "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}"
+                      "{\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14,\"completion_tokens_details\":{\"reasoning_tokens\":3}}}"
+                      "[DONE]"))
+           (response (maxwell::decode-chat-sse body)))
+      (check (maxwell/json:get-key response "usage")))
+    ;; The wire counts map onto a record, and the totals are derived.
+    (let ((stat (maxwell::request-stat-begin "test-model" :chat-completions)))
+      (maxwell::note-request-piece stat 5)
+      (maxwell::finish-request-stat
+        stat (maxwell/json:json-object
+               "choices" (maxwell/json:json-array)
+               "usage" (maxwell/json:json-object
+                          "prompt_tokens" 100
+                          "completion_tokens" 20
+                          "total_tokens" 120
+                          "completion_tokens_details"
+                          (maxwell/json:json-object "reasoning_tokens" 5))))
+      (check (= 100 (maxwell::request-stat-prompt-tokens stat)))
+      (check (= 20 (maxwell::request-stat-completion-tokens stat)))
+      (check (= 120 (maxwell::request-stat-total-tokens stat)))
+      (check (= 5 (maxwell::request-stat-reasoning-tokens stat)))
+      (check (not (maxwell::request-stat-estimated stat)))
+      (check (eq stat (maxwell::latest-request-stat)))
+      (check (search "test-model" (maxwell::request-stat-line stat)))
+      (check (search "= 120 tokens" (maxwell::request-stat-line stat)))
+      ;; Output tokens per second is over the answering time, past the first
+      ;; piece; with a known latency and total it is exact.
+      (let ((timed (maxwell::request-stat-begin "m" :chat-completions)))
+        (setf (maxwell::request-stat-latency timed) 1.0
+              (maxwell::request-stat-total timed) 3.0)
+        (maxwell::request-stat-take-usage
+          timed (maxwell/json:json-object "completion_tokens" 10))
+        (maxwell::request-stat-finish-tokens timed)
+        (check (= 5.0 (maxwell::request-stat-tokens-per-second timed)))))
+    ;; No usage: the output tokens are estimated from the reply's size.
+    (let ((stat (maxwell::request-stat-begin "m" :chat-completions)))
+      (maxwell::finish-request-stat
+        stat (maxwell/json:json-object
+               "choices"
+               (maxwell/json:json-array
+                 (maxwell/json:json-object
+                   "message" (maxwell/json:json-object
+                                "role" "assistant"
+                                "content" "abcdefgh")))))
+      (check (maxwell::request-stat-estimated stat))
+      (check (= 2 (maxwell::request-stat-completion-tokens stat)))
+      (check (= 2 (maxwell::request-stat-total-tokens stat))))
+    ;; The report reads over whatever has been recorded.
+    (check (search "request" (maxwell::request-stats-report)))))
+
 (defun run-tests ()
   ;; Tests may be run by the live agent through COMMON_LISP.
   (let ((maxwell:*agent* nil)
@@ -802,6 +859,7 @@
         (maxwell::*status-bar-extra-rows* 0)
         (maxwell::*status-bar-drawn-rows* '())
         (maxwell::*reasoning-delta-function* nil)
+        (maxwell::*request-stats* '())
         (maxwell::*older-entries-function* nil)
         (maxwell::*color* nil)
         (maxwell::*pending-image* nil)
@@ -829,6 +887,7 @@
     (test-responses-adapter)
     (test-responses-sse)
     (test-reasoning-streams)
+    (test-request-stats)
     (test-auth-encoding)
     (test-openai-client-contract)
     (test-model-catalog)

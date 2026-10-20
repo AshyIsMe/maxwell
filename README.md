@@ -245,6 +245,15 @@ Memory summaries are written by the same provider. `--compact-model MODEL` (or
 the provider. Without it Maxwell uses the main model and says once that this
 may cost more.
 
+Every model request is measured. `/stats` lists the recent ones, newest first:
+the time to the first streamed piece, the total response time, the output
+tokens per second, and the token counts the provider reported -- input, output,
+and how many of the output tokens were reasoning. Chat Completions requests ask
+for a usage report (`stream_options.include_usage`); when a provider reports
+none, the output tokens are estimated from the reply's length and the line is
+marked `(estimated)`. The report ends with averages. The records keep the last
+200 requests, newest first, and are saved in the global image with the chat.
+
 Use repeated `--header 'Name: value'` flags for gateway-specific headers. Use
 `--request-json '{"temperature":0.2}'` for provider-specific request fields;
 Maxwell always supplies the model, conversation, and tools itself. A compatible

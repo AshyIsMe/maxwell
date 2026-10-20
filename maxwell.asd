@@ -18,6 +18,7 @@
   :serial t
   :components ((:file "src/package")
                (:file "src/json")
+               (:file "src/stats")
                (:file "src/runtime")
                (:file "src/style")
                (:file "src/highlight")
