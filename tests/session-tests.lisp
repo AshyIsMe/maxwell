@@ -92,11 +92,13 @@ REQUESTS and answers with REPLY of the request count."
       ;; Everything is logged as it happens, in order.
       (check (equal '(:user :maxwell :tool :echo :maxwell)
                     (map 'list #'maxwell::message-kind (maxwell::chat-messages chat))))
-      ;; The in-turn history keeps the whole result; the log clips it.
+      ;; The in-turn history clips a huge result just as the log does,
+      ;; so no single tool message can blow the provider's context limit.
       (let ((tool-message (find "tool" (maxwell:agent-history agent)
                                 :key (lambda (message) (maxwell/json:get-key message "role"))
                                 :test #'equal)))
-        (check (> (length (content tool-message)) 40000)))
+        (check (<= (length (content tool-message)) 30000))
+        (check (search "clipped" (content tool-message))))
       (check (<= (length (maxwell::message-text (maxwell::logged-message chat 3))) 30000))
       ;; Transcript entries carry their log ids.
       (check (equal '(0 1 2 3 4)

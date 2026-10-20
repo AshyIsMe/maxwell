@@ -58,6 +58,19 @@
       ;; The view, the message, the tool call, its result, and the reply.
       (check (= 5 (length (maxwell:agent-history agent)))))))
 
+(defun test-tool-result-clipping ()
+  ;; A tool result the model would choke on is clipped to the same head and
+  ;; tail the log keeps, so no single tool message can exceed the limit.
+  (let* ((call (tool-call "(+ 1 1)"))
+         (huge (concatenate 'string "HEAD" (long-text 70000) "TAIL"))
+         (message (maxwell::tool-result-message call huge))
+         (content (maxwell::get-key message "content")))
+    (check (<= (length content) 30000))
+    (check (string= "HEAD" (subseq content 0 4)))
+    (check (string= "TAIL" (subseq content (- (length content) 4))))
+    (check (search "clipped" content))
+    (check (string= (maxwell::clip-tool-output huge) content))))
+
 (defun entries-text (entries)
   (format nil "~{~A~^~%~}" (map 'list #'maxwell::entry-text entries)))
 
@@ -883,6 +896,7 @@
     (test-eval)
     (test-vendored-libraries)
     (test-agent-loop)
+    (test-tool-result-clipping)
     (test-nested-agent-run)
     (test-responses-adapter)
     (test-responses-sse)

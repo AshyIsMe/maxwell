@@ -325,7 +325,8 @@ messages one per line, older ones merged, every line tagged with its project
 A turn is `[system prompt][view][turn state + your message]`. The system prompt
 and the old part of the view do not change from turn to turn, so providers can
 cache them. No other conversation carries over: within a turn the model sees
-whole tool results, but the log keeps at most 30,000 characters of each.
+each tool result as the log keeps it, at most 30,000 characters, its head and
+tail, so one huge result cannot overflow the context.
 
 The model reads further through its one tool: `(maxwell:zoom id n)` opens line
 `id+n` into the two lines it was made from, `(maxwell:zoom id 1)` returns

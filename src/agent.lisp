@@ -80,9 +80,12 @@ a transcript entry carrying its id. Returns the entry."
                   :ok-p ok-p :id (first ids) :show show)))
 
 (defun tool-result-message (call result)
+  ;; The model sees exactly what the log keeps: a huge result (say, a printed
+  ;; structure of many megabytes) is clipped to its head and tail rather than
+  ;; sent whole, which could exceed the provider's context limit.
   (json-object "role" "tool"
                "tool_call_id" (get-key call "id")
-               "content" result))
+               "content" (clip-tool-output result)))
 
 (defun evaluate-tool-call (agent call)
   "Run CALL's code. Returns the result text and whether it succeeded."
@@ -110,8 +113,8 @@ a transcript entry carrying its id. Returns the entry."
 
 (defun execute-tool-call (agent call)
   "Run CALL and return its tool message. The call and its result are logged
-and recorded as they happen; the message keeps the whole result, while the
-log clips a long one."
+and recorded as they happen, and both the log and the message sent back to
+the model clip a very long result to its head and tail."
   (set-activity :tooling (tool-call-name call))
   (multiple-value-prog1
       (progn
