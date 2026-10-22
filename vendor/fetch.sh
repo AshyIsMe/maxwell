@@ -15,6 +15,10 @@ trap 'rm -rf "${work}"' EXIT
 
 # name  repository  commit (tag in the comment)
 pins=(
+  "bordeaux-threads https://github.com/sionescu/bordeaux-threads.git         a44d59ee2452b360369750a675d673abb2175e0f" # master, 2026-10-21
+  "global-vars      https://github.com/lmj/global-vars.git                   c749f32c9b606a1457daa47d59630708ac0c266e" # master, 2026-10-21
+  "trivial-features https://github.com/trivial-features/trivial-features.git 828246a1c1efdcad94c1ba2f2a210bb9cb4cde3e" # master, 2026-10-21
+  "trivial-garbage  https://github.com/trivial-garbage/trivial-garbage.git   f0663f7b0c900ed78ac19f6db306e7c6cac999fd" # master, 2026-10-21
   "fset             https://github.com/slburson/fset.git                     1af9d2084d94457a2be39d8a6017f760a622c37c" # v2.5.0
   "misc-extensions  https://github.com/slburson/misc-extensions.git          c35c739e0180b828d73c10247cce6edf313e8086" # v4.3.2
   "named-readtables https://github.com/melisgl/named-readtables.git          9b774b51a08124c41881f10b30fb33425a3e6085" # master, 2026-07-01
@@ -53,7 +57,9 @@ tar -xzf "${work}/mt19937.tgz" -C "${work}"
 mv "${work}/mt19937-1.1.1" "${work}/mt19937"
 rm "${work}/mt19937.tgz"
 
-for name in fset misc-extensions named-readtables mgl-pax-bootstrap alexandria mt19937; do
+for name in bordeaux-threads global-vars trivial-features trivial-garbage \
+            fset misc-extensions named-readtables mgl-pax-bootstrap alexandria \
+            mt19937; do
   rm -rf "${vendor_dir:?}/${name}"
   mv "${work}/${name}" "${vendor_dir}/${name}"
 done

@@ -178,6 +178,16 @@ try:
     expect(b'\x1b[3J')
     expect(b'+2 lines (ctrl-t to expand)')
     expect(b'maxwell> ')
+    # Ctrl-C cancels a turn in flight, and the next prompt still works.
+    send(b'cancel this' + ENTER)
+    expect(b'steer> ')
+    send(bytes([3]))
+    expect(b'Interrupted.')
+    expect(b'maxwell> ')
+    send(b'carry on' + ENTER)
+    expect(b'reply-')
+    expect(b'maxwell> ')
+
 
     send(b'/quit' + ENTER)
     # Quitting saves the chat to the (scratch) global image first.
@@ -202,3 +212,4 @@ finally:
     server.shutdown()
     # Quitting saved the chat to a large image in the scratch directory.
     shutil.rmtree(scratch, ignore_errors=True)
+

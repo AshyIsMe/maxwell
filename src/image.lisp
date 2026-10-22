@@ -165,10 +165,26 @@ IMAGE; the next maxwell continues from there."
 (defun checkpoint (&optional (image *checkpoint-path*))
   "Save the running Maxwell, with its chat and all Lisp state, as IMAGE and
 keep running. Compaction requests get a few seconds to finish, then the rest
-are cancelled and queued again. A forked child writes the image next to IMAGE
-and the parent renames it into place. Returns IMAGE."
+are cancelled and queued again. The save runs on the UI thread only, and worker
+threads are stopped first, because SBCL cannot fork with threads running; the
+compactor is started again afterwards. A forked child writes the image next to
+IMAGE and the parent renames it into place. Returns IMAGE."
   (unless image (error "This session has no image to save to."))
+  ;; The fork in the middle cannot happen beside other threads, and the UI
+  ;; thread owns the terminal, so the save only makes sense there. A worker that
+  ;; asked for one would be a thread that the save has to stop before it can
+  ;; fork, and the worker would wait for a save that waits for it.
+  (unless (ui-thread-p)
+    (error "A checkpoint must run on the UI thread, and this is a worker. ~
+Use maxwell:request-image to have the turn save an image when it ends."))
+  (%checkpoint image))
+
+(defun %checkpoint (image)
   (set-activity :saving)
+  ;; A checkpoint is a safe boundary for workers: stop them before the fork, and
+  ;; start the compactor again when the fork is over.
+  (stop-compactor-worker)
+  (quiesce-workers)
   (unwind-protect
        (let ((temporary (checkpoint-temporary-path image)))
          (when *chat* (compactor-drain *chat* *checkpoint-drain-seconds*))
@@ -178,15 +194,17 @@ and the parent renames it into place. Returns IMAGE."
          (finish-output *error-output*)
          ;; SBCL forks only with one thread, which Maxwell has by design.
          (let ((pid (handler-case (sb-posix:fork)
-                      (error (condition)
-                        (save-and-exit-checkpoint temporary image condition)))))
+                       (error (condition)
+                         (save-and-exit-checkpoint temporary image condition)))))
            (when (zerop pid) (save-checkpoint-child temporary))
            (unless (and (wait-for-child pid) (probe-file temporary))
              (ignore-errors (delete-file temporary))
              (error "Could not save the image to ~A." temporary))
            (commit-checkpoint temporary (native image))
            image))
+    (restart-compactor-worker)
     (set-activity :idle)))
+
 
 ;;; Moving a chat between builds
 
@@ -323,3 +341,7 @@ load fails."
                  (and (plusp (length log))
                       (subseq log (max 0 (- (length log) 2000))))))))
     *source-directory*))
+
+
+
+

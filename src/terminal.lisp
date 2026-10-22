@@ -206,6 +206,8 @@ the next prompt instead of being discarded.")
         (cursor (prompt-editor-cursor editor)))
     (cond
       ((null key) :cancel)
+      ;; Ctrl-C abandons the line, as it always has.
+      ((and (characterp key) (= (char-code key) 3)) :interrupt)
       ((eq key :page-up) :browse)
       ((eq key :toggle-tools) :toggle)
       ((and (characterp key) (find key '(#\Newline #\Return))) :submit)
@@ -291,17 +293,28 @@ no key arrives, so background work such as compaction continues."
   (let ((editor (make-prompt-editor agent input output :text *prompt-draft*)))
     (setf *prompt-draft* "")
     (editor-redraw editor)
-    (loop for key = (progn (await-key input idle) (terminal-key input))
-          for action = (editor-key editor key)
-          do (case action
-               (:browse (browse-transcript input output))
-               (:toggle (toggle-tool-display) (redraw-transcript output))
-               (:submit
-                (echo-submitted-prompt editor)
-                (remember-prompt (prompt-editor-text editor))
-                (return (prompt-editor-text editor)))
-               (:cancel (return nil)))
-             (editor-redraw editor))))
+    (loop
+      ;; Ctrl-C raises a flag rather than interrupting a thread; the prompt acts
+      ;; on it by discarding the line being typed.
+      (when (take-interrupt)
+        (setf (prompt-editor-text editor) ""
+              (prompt-editor-cursor editor) 0
+              (prompt-editor-index editor) 0))
+      (let* ((key (progn (await-key input (or idle #'drain-ui-queue))
+                         (terminal-key input)))
+             (action (editor-key editor key)))
+        (case action
+          (:browse (browse-transcript input output))
+          (:toggle (toggle-tool-display) (redraw-transcript output))
+          (:submit
+           (echo-submitted-prompt editor)
+           (remember-prompt (prompt-editor-text editor))
+           (return (prompt-editor-text editor)))
+          (:interrupt
+           (editor-erase editor)
+           (return ""))
+          (:cancel (return nil)))
+        (editor-redraw editor)))))
 
 ;;; Steering input: while the model works the prompt stays live, so the user can
 ;;; browse the transcript with PgUp/PgDn and type prompts that reach the model
@@ -309,7 +322,9 @@ no key arrives, so background work such as compaction continues."
 
 (defstruct (steering-session (:constructor %make-steering-session))
   editor
-  (shown nil))
+  (shown nil)
+  ;; The turn the session is steering, so its check can stop servicing keys.
+  turn)
 
 (defun make-steering-session (agent input output)
   (%make-steering-session
@@ -347,9 +362,11 @@ while the model thinks, the live reasoning trace."
 (defun service-steering-input (session)
   "Handle keystrokes waiting while the model works. Returns T when any arrived.
 PgUp/PgDn browse the transcript and Ctrl-T redraws it with tool calls expanded
-or collapsed; the steering line is drawn again afterwards."
+or collapsed, Ctrl-C cancels the turn; the steering line is drawn again
+afterwards. Runs on the UI thread."
   (let* ((editor (steering-session-editor session))
          (input (prompt-editor-input editor))
+         (turn (steering-session-turn session))
          (handled nil)
          (prompt (if *busy-text*
                      (format nil "~A steer> " (styled :dim *busy-text*))
@@ -358,6 +375,12 @@ or collapsed; the steering line is drawn again afterwards."
     (unless (string= prompt (prompt-editor-prompt editor))
       (setf (prompt-editor-prompt editor) prompt
             (steering-session-shown session) nil))
+    ;; Ctrl-C, from the signal handler, stops the turn in flight.
+    (when (and turn (not (summary-waiting-p)) (take-interrupt))
+      (setf handled t)
+      (steering-hide session)
+      (record-entry :status "Interrupted." :ok-p nil :show t)
+      (cancel-turn turn))
     (loop while (listen input)
           do (setf handled t)
              (let ((key (terminal-key input)))
@@ -368,6 +391,10 @@ or collapsed; the steering line is drawn again afterwards."
                      (:browse (browse-transcript input (prompt-editor-output editor)))
                      (:toggle (toggle-tool-display)
                       (redraw-transcript (prompt-editor-output editor)))
+                     (:interrupt
+                      (when (and turn (cancel-turn turn))
+                        (steering-hide session)
+                        (record-entry :status "Interrupted." :ok-p nil :show t)))
                      (otherwise nil)))))
     (if handled
         (progn (editor-redraw editor)
@@ -377,11 +404,12 @@ or collapsed; the steering line is drawn again afterwards."
 
 (defun read-interactive-prompt (agent)
   "Read the next prompt line, or NIL at end of input. Ctrl-C discards the line
-being typed and returns an empty one."
-  (handler-case (read-interactive-line agent)
-    (sb-sys:interactive-interrupt ()
-      (fresh-line)
-      "")))
+being typed and returns an empty one. The prompt, which is the UI thread, also
+runs work queued by workers while it waits."
+  (let ((line (read-interactive-line agent)))
+    (when (take-interrupt)
+      (setf line ""))
+    line))
 
 (defun read-interactive-line (agent)
   (let ((state (interactive-terminal-state)))
@@ -389,8 +417,11 @@ being typed and returns an empty one."
         (unwind-protect
              (progn
                (terminal-command "-icanon" "-echo" "min" "1" "time" "0")
+               ;; The compactor has a worker of its own, so the prompt only runs
+               ;; work queued by workers -- and a cancelled turn's worker may still
+               ;; be recording what it did.
                (read-terminal-prompt agent *standard-input* *standard-output*
-                                     :idle (lambda () (tick-compactor agent))))
+                                     :idle #'drain-ui-queue))
           (terminal-command state))
         (progn
           (format t "~&maxwell> ")
@@ -398,3 +429,4 @@ being typed and returns an empty one."
           (let ((line (read-line *standard-input* nil nil)))
             (when line (remember-prompt line))
             line)))))
+

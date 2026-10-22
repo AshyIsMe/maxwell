@@ -56,9 +56,9 @@
     (normalize-message-reasoning message)))
 
 (defun invoke-model (agent)
-  (set-activity :thinking)
+  (ui-post-activity :thinking)
   ;; The live reasoning trace belongs to this request alone.
-  (hide-reasoning-trace)
+  (ui-call #'hide-reasoning-trace)
   (unwind-protect
        (if (agent-model-function agent)
            (funcall (agent-model-function agent) (wire-messages agent)
@@ -67,15 +67,18 @@
                           (json-array (common-lisp-tool))))
     ;; The reply arrived, or the request failed: take the trace away, since the
     ;; model is done thinking.
-    (hide-reasoning-trace)
-    (set-activity :responding)))
+    (ui-call #'hide-reasoning-trace)
+    (ui-post-activity :responding)))
 
 ;;; Logging
 
 (defun log-entry (kind text &key (ok-p t) (show *show-entries*) (agent *agent*))
   "Log TEXT in *CHAT* as a KIND message from AGENT's workspace, and record it as
-a transcript entry carrying its id. Returns the entry."
-  (let ((ids (chat-append *chat* kind text :workspace (agent-workspace agent))))
+a transcript entry carrying its id. Returns the entry. A turn's worker may call
+this, so the append takes the chat lock and the entry, which the UI thread
+owns, is recorded through RECORD-ENTRY."
+  (let ((ids (with-chat-lock
+               (chat-append *chat* kind text :workspace (agent-workspace agent)))))
     (record-entry (if (eq kind :maxwell) :assistant kind) text
                   :ok-p ok-p :id (first ids) :show show)))
 
@@ -115,58 +118,106 @@ a transcript entry carrying its id. Returns the entry."
   "Run CALL and return its tool message. The call and its result are logged
 and recorded as they happen, and both the log and the message sent back to
 the model clip a very long result to its head and tail."
-  (set-activity :tooling (tool-call-name call))
+  (ui-post-activity :tooling (tool-call-name call))
   (multiple-value-prog1
       (progn
         (log-entry :tool (tool-call-text call) :agent agent)
         (multiple-value-bind (result ok-p) (evaluate-tool-call agent call)
           (log-entry :echo result :ok-p ok-p :agent agent)
           (tool-result-message call result)))
-    (set-activity :thinking)))
+    (ui-post-activity :thinking)))
 
 (defun message-content (message)
   (let ((content (get-key message "content")))
     (if (stringp content) content "")))
 
 (defun finish-pending-image ()
-  (when *pending-image*
+  "Save the image the turn asked for. Only the UI thread can: the save forks
+and ends the process, and it may not happen beside worker threads. On a worker
+this does nothing, and the caller (RUN on the UI thread, or the interactive
+turn once its worker has ended) carries the request out later."
+  (when (and *pending-image* (ui-thread-p))
     (let ((path *pending-image*))
       (setf *pending-image* nil)
       ;; The snapshot ends the process, so the global chat is saved first.
       (when *checkpoint-path* (checkpoint))
       (save-image path))))
 
+(defun pending-image-pending-p ()
+  (not (null *pending-image*)))
+
+;;; Turns on their own thread. The structure comes first, because the
+;;; summary wait and RUN ask about the turn in flight.
+
+(defstruct (turn (:constructor %make-turn))
+  "One running turn: its worker, whether it was cancelled, and its outcome."
+  prompt
+  agent
+  worker
+  (cancelled nil)
+  ;; Set while the turn waits for memory summaries, when Ctrl-C ends the wait
+  ;; rather than the turn.
+  (summary-waiting nil)
+  (done nil)
+  (result nil)
+  (condition nil))
+
+(defvar *current-turn* nil
+  "The turn the UI thread is waiting on, so that Ctrl-C can cancel it.")
+
+(defvar *in-turn* nil
+  "True inside a turn's worker thread. A nested run -- a test suite a tool
+call starts -- then runs in place rather than starting a thread of its own,
+and keeps its transcript and its chat to itself.")
+
 ;;; Steering
 
 (defvar *steering* '()
   "Prompts typed while a turn is running, oldest first. They reach the model
-before its next request, so the user can redirect work already in progress.")
+before its next request, so the user can redirect work already in progress.
+The UI thread queues them and the turn's worker takes them, so the variable is
+guarded by *STEERING-LOCK*.")
+
+(defvar *steering-lock* (bt:make-lock "maxwell steering"))
 
 (defun queue-steering (text)
   "Record TEXT as a steering prompt for the model's next request."
   (when (plusp (length (string-trim '(#\Space #\Tab) text)))
-    (setf *steering* (append *steering* (list text)))
+    (bt:with-lock-held (*steering-lock*)
+      (setf *steering* (append *steering* (list text))))
     ;; The steering line already echoed it.
     (record-entry :steer text :show nil))
   text)
 
 (defun steering-pending-p ()
   "True when a steering prompt is waiting to be delivered."
-  (not (null *steering*)))
+  (bt:with-lock-held (*steering-lock*) (not (null *steering*))))
+
+(defun take-steering ()
+  "Remove and return the queued steering prompts, oldest first."
+  (bt:with-lock-held (*steering-lock*)
+    (prog1 *steering* (setf *steering* '()))))
 
 (defun inject-steering (agent)
   "Log queued steering prompts as :USER messages and append them to AGENT's
-history."
-  (let ((pending *steering*))
-    (setf *steering* '())
-    (dolist (text pending)
-      (let ((id (first (chat-append *chat* :user text :workspace (agent-workspace agent))))
-            (entry (find-if (lambda (entry)
-                              (and (eq (entry-kind entry) :steer) (null (entry-id entry))
-                                   (string= (entry-text entry) text)))
-                            *session-entries* :from-end t)))
-        (when entry (setf (entry-id entry) id))))
+history. The transcript and the chat belong to the UI thread, so the entry's id
+is filled in there."
+  (let ((pending (take-steering)))
     (when pending
+      (let ((ids (with-chat-lock
+                   (loop for text in pending
+                         collect (first (chat-append *chat* :user text
+                                                     :workspace (agent-workspace agent)))))))
+        (ui-call
+          (lambda ()
+            (loop for text in pending
+                  for id in ids
+                  do (let ((entry (find-if (lambda (entry)
+                                             (and (eq (entry-kind entry) :steer)
+                                                  (null (entry-id entry))
+                                                  (string= (entry-text entry) text)))
+                                           *session-entries* :from-end t)))
+                       (when entry (setf (entry-id entry) id)))))))
       (setf (agent-history agent)
             (append (agent-history agent)
                     (mapcar (lambda (text)
@@ -180,6 +231,13 @@ history."
   "When non-NIL, a short text, such as a spinner frame, that the steering line
 shows before its prompt while a turn waits.")
 
+(defun summary-waiting-p ()
+  "True while the current turn waits for memory summaries. Ctrl-C ends that
+wait rather than the turn, so the UI thread leaves the interrupt to the turn's
+own thread then. The flag lives on the turn, not in a dynamic binding: the UI
+thread asks about a turn that runs on another thread."
+  (and *current-turn* (turn-summary-waiting *current-turn*)))
+
 (defparameter *summary-wait-limit* 600
   "The most seconds a turn waits for earlier messages to be summarized.")
 
@@ -190,75 +248,86 @@ or through its client when it has no fake model."
 
 (defun tick-compactor (&optional (agent *agent*) (chat *chat*))
   "Advance CHAT's background compaction for AGENT without blocking. Requests
-reuse the turns' system prompt and tools, so they share their cache prefix."
+reuse the turns' system prompt and tools, so they share their cache prefix.
+The UI thread may call this while a turn's worker also does, so the tick takes
+the chat lock."
   (when (and agent chat)
-    ;; Ctrl-C waits until the tick is over, so it never leaves the chat
-    ;; halfway through an update.
-    (sb-sys:without-interrupts
-      (handler-case
+    (handler-case
+        (with-chat-lock
           (compactor-tick chat (and (compactor-available-p agent)
                                     (null (agent-compact-function agent))
                                     (agent-client agent))
                           :model-function (agent-compact-function agent)
                           :tools (json-array (common-lisp-tool))
-                          :system-prompt (agent-system-prompt agent))
-        ;; Compaction is background work: it must never break a turn.
-        (error () nil)))))
+                          :system-prompt (agent-system-prompt agent)))
+      ;; Compaction is background work: it must never break a turn.
+      (error () nil))))
+
+(defun set-busy-text (text)
+  "Show TEXT, such as a spinner frame, before the steering prompt."
+  (if (ui-thread-p)
+      (setf *busy-text* text)
+      (ui-post (lambda () (setf *busy-text* text)))))
 
 (defun await-summaries (agent id)
   "Wait until every message before ID is summarized, so the view shows the
 whole chat before message ID. The steering line stays live and shows a
 spinner meanwhile. The wait ends early, with a note in the transcript, when
 the compactor cannot make progress (no usable model, or every request
-failed), after *SUMMARY-WAIT-LIMIT* seconds, or when the user presses Ctrl-C;
+failed), after *SUMMARY-WAIT-LIMIT* seconds, or when the turn is cancelled;
 the turn then goes ahead with the view up to the first missing summary.
 Returns true when the view is complete."
   (let ((chat *chat*))
-    (when (summarized-before-p chat id)
+    (when (with-chat-lock (summarized-before-p chat id))
       (return-from await-summaries t))
-    (set-activity :summarizing)
+    (ui-post-activity :summarizing)
     (record-entry :status "Summarizing earlier messages before sending… (Ctrl-C sends now)")
+    ;; While this wait runs, Ctrl-C ends the wait rather than the turn, so the
+    ;; UI thread leaves the interrupt to this thread.
+    (when *current-turn* (setf (turn-summary-waiting *current-turn*) t))
     (let ((deadline (+ (get-internal-real-time)
                        (* *summary-wait-limit* internal-time-units-per-second)))
           (frames "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
           (frame 0)
           (outcome nil))
-      (handler-case
-          (loop
-            ;; Ctrl-C is held back while the chat changes and the steering
-            ;; line is drawn, so it arrives during the sleep.
-            (sb-sys:without-interrupts
-              (tick-compactor agent chat)
-              (setf outcome
-                    (cond ((summarized-before-p chat id) :done)
-                          ((or (not (compactor-available-p agent))
-                               (compactor-idle-p chat))
-                           "Memory summaries cannot be built now (see /memory).")
-                          ((> (get-internal-real-time) deadline)
-                           "Memory summaries are taking too long.")))
-              (unless outcome
-                (let ((*busy-text* (string (char frames (mod (incf frame) (length frames))))))
-                  (when *input-poll* (funcall *input-poll*)))))
-            (when outcome (return))
-            (sleep 0.05))
-        (sb-sys:interactive-interrupt ()
-          (setf outcome "Interrupted.")))
+      (unwind-protect
+           (loop
+             (tick-compactor agent chat)
+             (setf outcome
+                   (cond ((with-chat-lock (summarized-before-p chat id)) :done)
+                         ((take-interrupt) "Interrupted.")
+                         ((turn-cancelled-p) "Interrupted.")
+                         ((or (not (compactor-available-p agent))
+                              (with-chat-lock (compactor-idle-p chat)))
+                          "Memory summaries cannot be built now (see /memory).")
+                         ((> (get-internal-real-time) deadline)
+                          "Memory summaries are taking too long.")))
+             (unless outcome
+               (set-busy-text (string (char frames (mod (incf frame) (length frames))))))
+             (when outcome (return))
+             (sleep 0.05))
+        (when *current-turn* (setf (turn-summary-waiting *current-turn*) nil))
+        (set-busy-text nil))
       (unless (eq outcome :done)
-        (record-entry :status
-                      (format nil "~A Sending with the view up to message ~D; ~
-                                   ~D earlier message~:P left out."
-                              outcome (chat-leaf-frontier chat)
-                              (- id (chat-leaf-frontier chat)))
-                      :ok-p nil))
-      (set-activity :thinking)
+        ;; Last words outside the lock: RECORD-ENTRY runs on the UI thread.
+        (let ((frontier (with-chat-lock (chat-leaf-frontier chat))))
+          (record-entry :status
+                        (format nil "~A Sending with the view up to message ~D; ~
+                                     ~D earlier message~:P left out."
+                                outcome frontier (- id frontier))
+                        :ok-p nil)))
+      (ui-post-activity :thinking)
       (eq outcome :done))))
 
 ;;; The turn
 
 (defun import-workspace-notes (agent)
-  "Log the workspace's AGENTS.md as a note when it is new or was edited."
+  "Log the workspace's AGENTS.md as a note when it is new or was edited. The
+note goes into the chat under the chat lock; the transcript entry is recorded
+outside it, because a worker records entries through the UI thread and the UI
+thread must never be asked for something while the chat lock is held."
   (handler-case
-      (let ((ids (import-agents-md *chat* (agent-workspace agent))))
+      (let ((ids (with-chat-lock (import-agents-md *chat* (agent-workspace agent)))))
         (when ids
           (record-entry :status
                         (format nil "Read ~A into memory."
@@ -285,13 +354,10 @@ message before it, then the turn state and PROMPT."
         (json-object "role" "user"
                      "content" (format nil "~A~%~%~A" (turn-state agent) prompt))))
 
-(defun run (prompt &key (agent (or *agent* (make-agent))) (print-response t))
-  "Run one user PROMPT through AGENT until the model stops calling Lisp.
-The prompt and everything the model says or runs are logged in *CHAT*; the
-model sees the chat through its view. Prompts typed while the model works are
-delivered before its next request. With PRINT-RESPONSE, tool calls and replies
-are printed as they arrive; otherwise they are only recorded. Returns the
-final reply."
+(defun %run-turn (prompt agent print-response)
+  "The turn itself, on whatever thread calls it. RUN and START-TURN both end
+up here; the work always belongs to a worker thread, except in a one-shot run
+or a test, where there is no UI thread to keep free."
   ;; Nested runs (including tests invoked by a tool) must restore the caller.
   (let* ((nested (and *agent* (not (eq agent *agent*))))
          ;; A run of another agent inside this one, such as tests a tool call
@@ -299,13 +365,13 @@ final reply."
          (*session-entries* (if nested (make-entry-vector) *session-entries*))
          (*chat* (if (or nested (null *chat*)) (make-chat) *chat*))
          (*show-entries* print-response)
-         (*agent* agent)
-         (*steering* '()))
+         (*agent* agent))
     (import-workspace-notes agent)
     ;; The prompt line already shows what the user typed.
     (let ((id (entry-id (log-entry :user prompt :show nil))))
       (await-summaries agent id)
-      (setf (agent-history agent) (turn-history agent *chat* id prompt)))
+      (with-chat-lock
+        (setf (agent-history agent) (turn-history agent *chat* id prompt))))
     (loop
       (inject-steering agent)
       (let* ((response (invoke-model agent))
@@ -322,11 +388,125 @@ final reply."
           (log-entry :maxwell content))
         (if (and (vectorp tool-calls) (plusp (length tool-calls)))
             (loop for call across tool-calls
-                  do (setf (agent-history agent)
+                  for index from 0
+                  do (when (plusp index) (pump-ui))
+                     (setf (agent-history agent)
                            (append (agent-history agent)
                                    (list (execute-tool-call agent call))))
-                     (tick-compactor agent))
+                     ;; The compactor has a worker of its own at the prompt, so this
+                     ;; only advances it where there is none: a one-shot run or a test.
+                     (unless (compactor-worker-live-p) (tick-compactor agent)))
             ;; A prompt typed while the model was answering continues the turn.
             (unless (steering-pending-p)
               (finish-pending-image)
               (return content)))))))
+
+(defun run (prompt &key (agent (or *agent* (make-agent))) (print-response t))
+  "Run one user PROMPT through AGENT until the model stops calling Lisp.
+The prompt and everything the model says or runs are logged in *CHAT*; the
+model sees the chat through its view. Prompts typed while the model works are
+delivered before its next request. With PRINT-RESPONSE, tool calls and replies
+are printed as they arrive; otherwise they are only recorded. Returns the
+final reply.
+
+On the UI thread a turn would freeze the prompt, so there it runs on a worker
+and this call waits for it, servicing keys meanwhile; inside a turn already,
+or when no thread owns the terminal, it runs in place. START-TURN is the
+version that hands back the running turn instead of waiting."
+  (if (and *ui-thread* (ui-thread-p) (not *in-turn*))
+      (multiple-value-prog1
+          (await-turn (start-turn prompt :agent agent :print-response print-response))
+        ;; A requested image is saved now, after its turn's worker has ended.
+        (finish-pending-image))
+      (%run-turn prompt agent print-response)))
+
+;;; Turns on their own thread
+
+(defun turn-cancelled-p ()
+  "True when the turn this thread belongs to was cancelled, as Ctrl-C does."
+  (and *current-turn* (turn-cancelled *current-turn*)))
+
+(defun turn-finished (turn result condition)
+  (setf (turn-result turn) result
+        (turn-condition turn) condition
+        (turn-done turn) t)
+  turn)
+
+(defun turn-main (turn prompt agent print-response)
+  (handler-case
+      (turn-finished turn (%run-turn prompt agent print-response) nil)
+    (error (condition)
+      (turn-finished turn nil condition))
+    ;; A cancelled turn unwinds through this, keeping what it logged so far.
+    (sb-sys:interactive-interrupt ()
+      (turn-finished turn nil nil))))
+
+(defun start-turn (prompt &key (agent (or *agent* (make-agent)))
+                          (print-response t) (bindings '()))
+  "Start PROMPT on a worker thread and return its TURN at once. The worker
+inherits the chat, the agent, and the transcript's settings: dynamic bindings
+do not reach a new thread by themselves, so they are passed explicitly. Extra
+BINDINGS, an alist of (SPECIAL . VALUE), reach the worker too."
+  (let* ((turn (%make-turn :prompt prompt :agent agent))
+         ;; The steering queue stays the one the UI thread queues into: the
+         ;; worker takes from the same place, so a prompt typed during the
+         ;; turn reaches the model. Anything left over is dropped.
+         (bindings (append bindings
+                           (list (cons '*chat* *chat*)
+                                 (cons '*agent* agent)
+                                 (cons '*session-entries* *session-entries*)
+                                 (cons '*show-entries* print-response)
+                                 (cons '*current-turn* turn)
+                                 (cons '*in-turn* t)))))
+    (take-steering)
+    (setf (turn-worker turn)
+          (start-worker "maxwell turn"
+                        (lambda () (turn-main turn prompt agent print-response))
+                        :bindings bindings))
+    turn))
+
+(defun cancel-turn (turn)
+  "Abandon TURN: stop its worker, which unwinds through cleanup and keeps
+whatever it already logged. Returns true when there was a turn to cancel."
+  (when (and turn (not (turn-done turn)))
+    (setf (turn-cancelled turn) t)
+    (let ((thread (worker-thread (turn-worker turn))))
+      (ignore-errors (bt:destroy-thread thread)))
+    (setf (turn-done turn) t
+          (turn-result turn) nil)
+    t))
+
+(defun await-turn (turn)
+  "Wait for TURN on the UI thread, keeping the prompt live: keys, queued work,
+and the compactor all run here while the turn's worker does the real work.
+Ctrl-C cancels the turn there. Returns the reply; re-signals the error the
+turn ended with, if any."
+  (let ((*current-turn* turn))
+    (unwind-protect
+         (progn
+           (loop until (turn-done turn)
+                 do (when (and (not (summary-waiting-p)) (take-interrupt))
+                      (record-entry :status "Interrupted." :ok-p nil :show t)
+                      (cancel-turn turn))
+                    (service-ui)
+                    (sleep 0.01))
+           (when (turn-condition turn) (error (turn-condition turn)))
+           (turn-result turn))
+      ;; A turn interrupted from outside still may run cleanup on its worker.
+      (when (and (turn-worker turn) (worker-alive-p (turn-worker turn)))
+        (ignore-errors (worker-join (turn-worker turn)))))))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

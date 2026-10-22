@@ -331,10 +331,7 @@ thought hidden by default, prints nothing at all."
   "Print ENTRY on its own, without recording it."
   (show-entry (vector entry) 0 stream))
 
-(defun record-entry (kind text &key (ok-p t) id (show *show-entries*)
-                                    (stream *standard-output*))
-  "Append an entry to *SESSION-ENTRIES* and return it. When SHOW is true it is
-printed on STREAM. The caller may set its ENTRY-ID once it is logged."
+(defun %record-entry (kind text ok-p id show stream)
   (let ((entry (make-entry kind text :ok-p ok-p :id id))
         (entries *session-entries*))
     ;; A result changes how the tool call before it is drawn.
@@ -343,6 +340,17 @@ printed on STREAM. The caller may set its ENTRY-ID once it is logged."
     (vector-push-extend entry entries)
     (when show (show-entry entries (1- (length entries)) stream))
     entry))
+
+(defun record-entry (kind text &key (ok-p t) id (show nil show-p)
+                                    (stream *standard-output*))
+  "Append an entry to *SESSION-ENTRIES* and return it. When SHOW is true it is
+printed on STREAM. The caller may set its ENTRY-ID once it is logged.
+The transcript belongs to the UI thread, so a worker's call runs there: the
+entry is recorded and drawn in its place, and this thread waits for it."
+  (let ((show (if show-p show *show-entries*)))
+    (if (ui-thread-p)
+        (%record-entry kind text ok-p id show stream)
+        (ui-call (lambda () (%record-entry kind text ok-p id show stream))))))
 
 (defun log-message-entry (message)
   "A transcript entry for MESSAGE from the OptChat log."

@@ -5,11 +5,22 @@
 ;;; counts the provider reports in its usage -- input, output, and the reasoning
 ;;; part of the output. When a provider reports no usage, the output tokens are
 ;;; estimated from the reply's size and marked as such. *REQUEST-STATS* keeps
-;;; the newest records, so /stats can show recent requests and their averages;
-;;; the records live in the global image like the chat.
+;;; the newest records for the retention time, so /stats can show recent
+;;; requests and their summary; the records live in the global image like the
+;;; chat.
 
-(defparameter *request-stats-limit* 200
-  "The most request records kept in *REQUEST-STATS*.")
+(defparameter *request-stats-retention-days*
+  (or (ignore-errors
+        (let ((days (uiop:getenv "MAXWELL_STATS_DAYS")))
+          (and (stringp days) (plusp (length days))
+               (parse-integer days :junk-allowed t))))
+      30)
+  "How many days of request records *REQUEST-STATS* keeps. Set from
+MAXWELL_STATS_DAYS, otherwise 30.")
+
+(defparameter *request-stats-limit* 20000
+  "The most request records kept in *REQUEST-STATS*: a hard ceiling on top of
+the retention time, so an extremely busy month cannot grow without bound.")
 
 (defvar *request-stats* '()
   "Newest-first list of REQUEST-STAT records, one per measured model request.")
@@ -130,9 +141,25 @@ tokens when the provider reported no usage."
                   (request-stat-estimated stat) t))))
       (request-stat-finish-tokens stat)
       (push stat *request-stats*)
-      (when (> (length *request-stats*) *request-stats-limit*)
-        (setf *request-stats* (subseq *request-stats* 0 *request-stats-limit*))))
+      (expire-request-stats))
     stat))
+
+(defun request-stats-cutoff (&key (time (get-universal-time)))
+  "The universal time before which a request record is too old to keep."
+  (- time (* *request-stats-retention-days* 24 60 60)))
+
+(defun expire-request-stats (&key (time (get-universal-time)))
+  "Drop records older than the retention time, then any beyond the ceiling.
+*REQUEST-STATS* is newest first, so old records sit at its end."
+  (let ((cutoff (request-stats-cutoff :time time)))
+    (setf *request-stats*
+          (remove-if (lambda (stat)
+                       (let ((started (request-stat-started stat)))
+                         (and started (< started cutoff))))
+                     *request-stats*)))
+  (when (> (length *request-stats*) *request-stats-limit*)
+    (setf *request-stats* (subseq *request-stats* 0 *request-stats-limit*)))
+  *request-stats*)
 
 (defun latest-request-stat ()
   "The most recent request record, or NIL."
@@ -166,22 +193,48 @@ never shown."
 (defun average-value (numbers)
   (when numbers (/ (reduce #'+ numbers) (length numbers))))
 
+(defun request-stat-answer-seconds (stat)
+  "The seconds STAT spent answering, past its first streamed piece: the
+denominator of its output rate. A reply that ended the moment it started falls
+back to its whole response time."
+  (let ((total (request-stat-total stat))
+        (latency (request-stat-latency stat)))
+    (when total
+      (let ((duration (if latency (- total latency) total)))
+        (if (plusp duration) duration total)))))
+
+(defun request-stats-summary (stats)
+  "A one-line summary over STATS. The output rate is tokens weighted: the
+completion tokens of every request over the answering time of every request,
+so a slow request with many tokens counts for more than its share of the mean
+of the per-request rates."
+  (let ((latencies (remove nil (mapcar #'request-stat-latency stats)))
+        (tokens (remove nil (mapcar #'request-stat-total-tokens stats)))
+        (completion 0)
+        (answering 0))
+    (dolist (stat stats)
+      (let ((count (request-stat-completion-tokens stat))
+            (seconds (request-stat-answer-seconds stat)))
+        (when (and count seconds (plusp seconds))
+          (incf completion count)
+          (incf answering seconds))))
+    (format nil "~D request~:P (last ~D days),~@[ first token ~,2Fs on average,~]~@[ ~:D tokens in all,~] ~:[no tokens measured~;~,1F tok/s over answering time~]"
+            (length stats)
+            *request-stats-retention-days*
+            (average-value latencies)
+            (and tokens (round (reduce #'+ tokens)))
+            (plusp answering)
+            (if (plusp answering) (/ completion answering) 0))))
+
 (defun request-stats-report (&optional (count 5))
   "A multi-line report of the last COUNT requests and their averages."
+  (expire-request-stats)
   (let ((stats *request-stats*))
     (if (null stats)
         "No requests recorded yet."
-        (let ((shown (subseq stats 0 (min count (length stats))))
-              (latencies (remove nil (mapcar #'request-stat-latency stats)))
-              (rates (remove nil (mapcar #'request-stat-tokens-per-second stats)))
-              (tokens (remove nil (mapcar #'request-stat-total-tokens stats))))
+        (let ((shown (subseq stats 0 (min count (length stats)))))
           (with-output-to-string (out)
             (format out "Last ~D request~:P (newest first):" (length shown))
             (dolist (stat shown)
               (format out "~&  ~A" (request-stat-line stat)))
-            (format out "~&Average over ~D request~:P:~@[ first token ~,2Fs,~]~@[ ~,1F tok/s,~]~@[ ~:D tokens~]"
-                    (length stats)
-                    (average-value latencies)
-                    (average-value rates)
-                    (let ((average (average-value tokens)))
-                      (and average (round average)))))))))
+            (format out "~&Summary: ~A" (request-stats-summary stats)))))))

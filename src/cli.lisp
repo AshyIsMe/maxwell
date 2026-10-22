@@ -290,9 +290,9 @@ default."
                 (or (set-effort client argument) "the provider's default")))))
 
 (defun run-interactive-turn (line agent)
-  "Run LINE, keeping the prompt live while the model works so that the user can
-browse the transcript and queue steering prompts. The compactor keeps working
-meanwhile."
+  "Run LINE on a worker thread, keeping the prompt live on this, the UI,
+thread: the user can browse the transcript and queue steering prompts, and
+Ctrl-C cancels the turn. The compactor has a worker of its own."
   (set-activity :idle)
   (unwind-protect
        (let ((state (interactive-terminal-state)))
@@ -303,19 +303,32 @@ meanwhile."
                     (terminal-command "-icanon" "-echo" "min" "1" "time" "0")
                     (let* ((session (make-steering-session agent *standard-input*
                                                            *standard-output*))
-                           (*input-poll* (lambda ()
-                                           (service-steering-input session)
-                                           (tick-compactor agent)))
-                           (*input-hide* (lambda () (steering-hide session)))
+                           ;; The steering line is drawn on the UI thread, and the
+                           ;; worker hides it from ITS thread when the output
+                           ;; starts, so the hide is handed over.
+                           (*input-hide* (lambda () (ui-call (lambda () (steering-hide session)))))
                            ;; A streamed reasoning trace shows while the model
-                           ;; thinks, and the prompt redraws it.
-                           (*reasoning-delta-function* #'note-live-reasoning))
-                      (unwind-protect (run line :agent agent)
-                        (steering-hide session)
-                        ;; An unfinished steering line becomes the next prompt.
-                        (setf *prompt-draft* (steering-draft session)))))
+                           ;; thinks, and the UI thread redraws it.
+                           (*reasoning-delta-function* #'note-live-reasoning)
+                           (turn (start-turn line :agent agent :print-response t
+                                                        :bindings
+                                                        (list (cons '*input-hide*
+                                                                    *input-hide*)
+                                                              (cons '*reasoning-delta-function*
+                                                                    #'note-live-reasoning)))))
+                      (setf (steering-session-turn session) turn)
+                      ;; Keystrokes and queued work come to the UI thread here.
+                      (let ((*ui-service* (lambda () (service-steering-input session))))
+                        (unwind-protect (await-turn turn)
+                          (steering-hide session)
+                          ;; An unfinished steering line becomes the next prompt.
+                          (setf *prompt-draft* (steering-draft session))
+                          ;; A turn that asked for an image gets it now that its
+                          ;; worker has ended: the save cannot run beside threads.
+                          (when (pending-image-pending-p) (finish-pending-image))))))
                (terminal-command state))))
     (set-activity :idle)))
+
 
 ;;; Reading the log back
 
@@ -370,7 +383,7 @@ QUIET. True unless saving failed."
 /effort LEVEL  set it: none, minimal, low, medium, or high
 /statusbar     show or hide the status bar above the prompt
 /memory        show the chat's size, summaries, and compactor jobs
-/stats         show timing and token counts for recent model requests
+/stats         show recent request timings and a tokens-weighted summary
 /import PATH   read a file into memory as a note
 /checkpoint    save the chat to the global image and keep going
 /reload        load Maxwell's source into this session, then save
@@ -398,16 +411,33 @@ before its next request.")
       (setf (agent-system-prompt *agent*) *base-system-prompt*))
     (save-session)))
 
+(defun compactor-tick-function (agent &optional (chat *chat*))
+  "The function the compactor's worker calls: it advances AGENT's background
+compaction in CHAT on the worker, which is a thread of its own. CHAT is taken
+now, because a worker inherits no dynamic bindings."
+  (lambda () (tick-compactor agent chat)))
+
+(defun start-background-work (agent)
+  "Start what runs beside the prompt: the compactor's worker and the Ctrl-C
+handler. The UI thread has already been claimed by MAIN."
+  (install-interrupt-handler)
+  (start-compactor-worker (compactor-tick-function agent)))
+
+(defun stop-background-work ()
+  (stop-compactor-worker)
+  (quiesce-workers))
+
 (defun interactive-loop (&optional (agent *agent*))
   (setf *agent* (or agent (make-agent)))
   (unless *chat* (setf *chat* (make-chat)))
-  (let ((start (chat-message-count *chat*)))
+  (start-background-work *agent*)
+  (let ((start (with-chat-lock (chat-message-count *chat*))))
     (setf *older-entries-function* (older-log-entries *chat* start))
     ;; A resumed chat shows where it left off.
     (when (plusp start)
       (show-recent-exchanges (recent-log-entries *chat*) :count 2)))
   (record-entry :status
-                (format nil "Maxwell ~A — ~A~%Type /help for commands; PgUp/PgDn browse the transcript, Ctrl-T expands tool calls and thoughts, Up/Down recall previous prompts."
+                (format nil "Maxwell ~A — ~A~%Type /help for commands; PgUp/PgDn browse the transcript, Ctrl-T expands tool calls and thoughts, Up/Down recall previous prompts, Ctrl-C stops a turn."
                         (client-model (agent-client *agent*))
                         (namestring (agent-workspace *agent*)))
                 :show t)
@@ -577,7 +607,10 @@ remembered session."
     (if (save-session :quiet t) status 1)))
 
 (defun main (&optional (arguments (uiop:command-line-arguments)))
-  "Run Maxwell with command-line ARGUMENTS. Returns the exit status."
+  "Run Maxwell with command-line ARGUMENTS. Returns the exit status. This
+thread is the UI thread: it owns the terminal, reads keys, and draws; turns and
+compaction run on workers of their own."
+  (claim-ui-thread)
   ;; Colour and the transcript belong to this terminal session, never to a
   ;; saved one.
   (reset-transcript)
@@ -613,4 +646,24 @@ remembered session."
 (defun image-main ()
   "The entry point of the built executable and of every saved image: run
 MAIN on the command line and exit with its status."
+  ;; An image is saved with no threads running, so nothing of a previous
+  ;; process survives into the new one: the UI claim is taken again by MAIN,
+  ;; and the queues start empty. A saved chat keeps its own compaction, so
+  ;; the new session installs its own tick in START-BACKGROUND-WORK.
+  (release-ui-thread)
+  (setf *workers* '()
+        *compactor-worker* nil
+        *compactor-tick* nil
+        *compactor-run* nil
+        *ui-queue* nil
+        ;; A signal handler does not survive being saved: install it again.
+        *interrupt-handler-installed* nil
+        *interrupt-requested* nil
+        *current-turn* nil)
   (sb-ext:exit :code (main) :abort nil))
+
+
+
+
+
+

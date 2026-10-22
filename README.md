@@ -251,8 +251,12 @@ tokens per second, and the token counts the provider reported -- input, output,
 and how many of the output tokens were reasoning. Chat Completions requests ask
 for a usage report (`stream_options.include_usage`); when a provider reports
 none, the output tokens are estimated from the reply's length and the line is
-marked `(estimated)`. The report ends with averages. The records keep the last
-200 requests, newest first, and are saved in the global image with the chat.
+marked `(estimated)`. The report ends with a summary over the kept records: the
+average first-token time, the tokens in all, and the output rate. The rate is
+tokens weighted -- completion tokens over answering time across every request,
+not the mean of the per-request rates, so a slow request with many tokens counts
+for more than its share. Records are kept for 30 days (`MAXWELL_STATS_DAYS` changes that) and capped at
+20,000, newest first, in the global image with the chat.
 
 Use repeated `--header 'Name: value'` flags for gateway-specific headers. Use
 `--request-json '{"temperature":0.2}'` for provider-specific request fields;
@@ -277,10 +281,10 @@ make build
 
 Terminal behaviour is covered by pty tests that drive the built executable:
 `python3 tests/terminal-pty.py` for editing, history, Ctrl-T, colour, and
-settings restoration; `python3 tests/terminal-pty-steering.py` for browsing and
-steering during a request (it serves a deliberately slow fake provider on a
-local port); `python3 tests/thinking-pty.py` for a provider that streams
-its reasoning, which is served on a local port too; and
+settings restoration; `python3 tests/terminal-pty-steering.py` for browsing,
+steering, and Ctrl-C during a request (it serves a deliberately slow fake
+provider on a local port); `python3 tests/thinking-pty.py` for a provider that
+streams its reasoning, which is served on a local port too; and
 `python3 tests/checkpoint-pty.py` for saving, restarting, the lock, and moving
 the chat between builds. All of them keep their images, sessions, and logins in
 a temporary directory.
@@ -289,10 +293,11 @@ a temporary directory.
 
 `vendor/` holds pinned copies of Alexandria and FSet, with FSet's own
 dependencies (misc-extensions, mt19937, named-readtables, and the
-mgl-pax-bootstrap part of mgl-pax). `maxwell.asd` puts them at the front of
-ASDF's central registry, so `make build`, `sbcl --script maxwell.lisp`, and
-`/reload` always use these copies, whatever else is installed, and leave your
-own ASDF configuration alone.
+mgl-pax-bootstrap part of mgl-pax), and Bordeaux Threads with its dependencies
+(global-vars, trivial-features, and trivial-garbage). `maxwell.asd` puts them
+at the front of ASDF's central registry, so `make build`,
+`sbcl --script maxwell.lisp`, and `/reload` always use these copies, whatever
+else is installed, and leave your own ASDF configuration alone.
 
 Inside Maxwell, and in the model's `common_lisp` calls, they are reached
 through package-local nicknames: `a:` for Alexandria and `f:` for FSet
@@ -466,6 +471,37 @@ single long tool call runs with the Lisp world locked, so keys pressed during it
 (Ctrl-T too) are handled as soon as it finishes — they wait in the terminal
 buffer and are not lost.
 
-This is done by running `curl` asynchronously and polling the terminal while it
-runs, rather than by evaluating tool calls on a second thread. Tool calls keep
-running on the one thread that owns the agent's Lisp world.
+This is done by running `curl` asynchronously in a child process and
+polling it, rather than waiting on it. Tool calls run on the turn's own
+worker thread, in the same Lisp world as the rest of Maxwell.
+
+### Threads
+
+The terminal belongs to one thread, the UI thread: it reads keys, draws the
+status bar and the prompt, and owns the transcript and the chat. Everything
+that takes time runs elsewhere. A turn runs on a worker of its own, so the
+prompt stays live and Ctrl-C can cancel the turn; the compactor has a second
+worker; and a subagent will be a third kind of worker, with an agent of its
+own. Workers hand work to the UI thread through a queue, and the UI thread
+runs it whenever it is idle -- between keystrokes, or while it waits for a
+turn -- so the transcript, the status bar, and the chat are only ever
+written on that one thread.
+
+Provider requests are still child `curl` processes, polled rather than waited
+on, so a streamed reply is shown as it arrives. Tool calls run on the turn's
+worker, in the same Lisp world as the rest of Maxwell.
+
+SBCL cannot fork, and so cannot checkpoint, with other threads running.
+`/checkpoint`, `/quit`, `/save`, and the image requested with
+`maxwell:request-image` therefore stop the compactor and wait for the turn to
+end, then fork. The compactor starts again straight afterwards. A saved image
+resumes with no threads and one empty queue; the UI thread installs the Ctrl-C
+handler again, because a signal handler does not survive being saved.
+
+Ctrl-C is handled by Maxwell, not by SBCL: the signal handler only raises a
+flag, and the UI thread decides what it means -- cancel the turn in flight,
+or clear the line being typed. While a turn waits for memory summaries the
+flag ends that wait instead of the turn, and the message is sent with the
+view built so far.
+
+

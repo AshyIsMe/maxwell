@@ -14,10 +14,11 @@
   :author "Maxwell contributors"
   :license "MIT"
   :version "0.1.0"
-  :depends-on ("uiop" "alexandria" "fset")
+  :depends-on ("uiop" "alexandria" "fset" "bordeaux-threads")
   :serial t
   :components ((:file "src/package")
                (:file "src/json")
+               (:file "src/threads")
                (:file "src/stats")
                (:file "src/runtime")
                (:file "src/style")
@@ -45,6 +46,7 @@
   :serial t
   :components ((:file "tests/package")
                (:file "tests/support")
+               (:file "tests/thread-tests")
                (:file "tests/ui-tests")
                (:file "tests/memory-tests")
                (:file "tests/session-tests")

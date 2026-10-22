@@ -881,8 +881,33 @@
       (check (maxwell::request-stat-estimated stat))
       (check (= 2 (maxwell::request-stat-completion-tokens stat)))
       (check (= 2 (maxwell::request-stat-total-tokens stat))))
+    ;; The summary is tokens weighted: completion tokens over answering time
+    ;; across every request, so a slow request with many tokens weighs more
+    ;; than the mean of the per-request rates.
+    (let ((fast (maxwell::make-request-stat
+                  :model "m" :tokens-per-second 100.0
+                  :latency 0.5 :total 1.5 :completion-tokens 100
+                  :total-tokens 200))
+          (slow (maxwell::make-request-stat
+                  :model "m" :tokens-per-second 10.0
+                  :latency 1.0 :total 11.0 :completion-tokens 100
+                  :total-tokens 200)))
+      ;; 200 tokens over 1.0s + 10.0s = 18.2 tok/s, not the mean rate 55.
+      (check (search "18.2 tok/s" (maxwell::request-stats-summary (list fast slow))))
+      (check (not (search "55.0 tok/s" (maxwell::request-stats-summary (list fast slow)))))
+      (check (search "2 requests" (maxwell::request-stats-summary (list fast slow)))))
+    ;; Records older than the retention time are dropped; recent ones are kept.
+    (let* ((now (get-universal-time))
+           (old (maxwell::make-request-stat :model "m" :started
+                                            (- now (* 31 24 60 60))))
+           (fresh (maxwell::make-request-stat :model "m" :started (- now 60))))
+      (let ((maxwell::*request-stats* (list fresh old)))
+        (maxwell::expire-request-stats :time now)
+        (check (equal (list fresh) maxwell::*request-stats*))))
+    (check (= 30 maxwell::*request-stats-retention-days*))
     ;; The report reads over whatever has been recorded.
-    (check (search "request" (maxwell::request-stats-report)))))
+    (check (search "request" (maxwell::request-stats-report)))
+    (check (search "Summary:" (maxwell::request-stats-report)))))
 
 (defun run-tests ()
   ;; Tests may be run by the live agent through COMMON_LISP.
@@ -943,6 +968,13 @@
     (test-chat-transplant)
     (test-startup-migration)
     (test-command-line)
+    (test-ui-queue)
+    (test-workers)
+    (test-interrupt-flag)
+    (test-threaded-turn)
+    (test-steering-shared-queue)
+    (test-compactor-worker)
+    (test-checkpoint-needs-ui-thread)
     (test-async-command)
     (test-terminal)
     (test-prompt-editing)
@@ -952,3 +984,4 @@
     (format t "~&~:[~D Maxwell test(s) failed~;All Maxwell tests passed~].~%"
             (zerop *failures*) *failures*)
     (zerop *failures*)))
+

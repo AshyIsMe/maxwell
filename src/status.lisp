@@ -51,12 +51,21 @@ name of the tool being run, is shown after it."
 ;;; NOTE-LIVE-REASONING while the model works; the prompt redraws the rows, and
 ;;; HIDE-REASONING-TRACE takes them away when the model's reply arrives.
 
-(defun note-live-reasoning (text)
+(defun %note-live-reasoning (text)
   "Add TEXT to the reasoning trace shown above the prompt while the model
 thinks. Returns the trace so far."
   (when (and (stringp text) (plusp (length text)))
     (setf *live-reasoning* (concatenate 'string (or *live-reasoning* "") text)))
   *live-reasoning*)
+
+(defun note-live-reasoning (text)
+  "Add streamed reasoning TEXT to the live trace. Pieces arrive on the thread
+that runs the request; the trace is drawn by the UI thread, so a worker's piece
+is handed over to it."
+  (if (ui-thread-p)
+      (%note-live-reasoning text)
+      (progn (ui-post (lambda () (%note-live-reasoning text)))
+             *live-reasoning*)))
 
 (defun hide-reasoning-trace ()
   "Forget the live reasoning trace and take its rows off the screen, so the

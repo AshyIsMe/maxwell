@@ -1,18 +1,19 @@
 (in-package #:maxwell)
 
-;;; Provider requests run in a child process. At the interactive prompt that
-;;; child would otherwise block Maxwell's only thread, so it is started
-;;; asynchronously and the prompt keeps servicing keystrokes while it runs.
-;;; Both hooks are NIL everywhere else, which leaves one-shot, scripted, and
-;;; test runs on the plain blocking path.
+;;; Provider requests run in a child process, which is polled rather than
+;;; waited on, so that output can be watched as it arrives. A child used to be
+;;; asynchronous only at the interactive prompt, whose one thread had to keep
+;;; servicing keystrokes; now it is always polled, and *INPUT-POLL* merely lets
+;;; the UI thread do its work between polls. Requests run on a worker thread,
+;;; so blocking there -- and streaming there -- never touches the prompt.
 ;;;
-;;; The same non-blocking machinery serves the background compactor: START-
-;;; COMMAND launches a child without waiting, COMMAND-FINISHED-P polls it, and
-;;; FINISH-COMMAND or CANCEL-COMMAND collects it. Nothing here needs a thread.
+;;; The same machinery serves the background compactor: START-COMMAND launches
+;;; a child without waiting, COMMAND-FINISHED-P polls it, and FINISH-COMMAND or
+;;; CANCEL-COMMAND collects it.
 
 (defvar *input-poll* nil
   "When non-NIL, a function called repeatedly while a subprocess runs, so that
-the interactive prompt can keep handling keystrokes.")
+the UI thread can keep handling keystrokes and queued work.")
 
 (defvar *input-hide* nil
   "When non-NIL, a function called once when a subprocess finishes, so that the
@@ -134,10 +135,14 @@ yet: the file is not there, or a partial character is still arriving."
         (when (probe-file path) (uiop:read-file-string path)))
     (error () nil)))
 
-(defun run-command-asynchronously (arguments input private-files watch)
-  "Run ARGUMENTS with INPUT on standard input, servicing keystrokes meanwhile.
-WATCH, when non-NIL, is called with each new piece of the command's output as
-it arrives, so a streamed reply can be shown while it is still coming."
+(defparameter *command-poll-interval* 0.02
+  "Seconds between polls of a child process while its output is watched.")
+
+(defun run-command-watched (arguments input private-files watch)
+  "Run ARGUMENTS with INPUT on standard input, calling WATCH with each new
+piece of the command's output as it arrives, so a streamed reply is seen while
+it is still coming. The UI thread's poll hook, when there is one, runs between
+polls."
   (unwind-protect
        (let ((job (start-command arguments :input input
                                            :private-files private-files))
@@ -151,8 +156,8 @@ it arrives, so a streamed reply can be shown while it is still coming."
                              (when (and text (> (length text) seen))
                                (funcall watch (subseq text seen))
                                (setf seen (length text)))))
-                         (funcall *input-poll*)
-                         (sleep 0.02))
+                         (when *input-poll* (funcall *input-poll*))
+                         (sleep *command-poll-interval*))
                 (multiple-value-prog1 (finish-command job)
                   (setf finished t)))
            (unless finished (cancel-command job))))
@@ -163,17 +168,20 @@ it arrives, so a streamed reply can be shown while it is still coming."
   "Run ARGUMENTS with INPUT on its standard input. Returns the command's
 output, its error output, and its exit status. PRIVATE-FILES are (PATH . TEXT)
 pairs that exist, owner-only, only while the command runs. WATCH, when non-NIL,
-is called with each new piece of the output while an asynchronous command
-runs."
-  (if (null *input-poll*)
-      (unwind-protect
-           (progn
-             (write-private-files private-files)
-             (multiple-value-bind (output error-output status)
-                 (uiop:run-program arguments
-                                   :input (make-string-input-stream (or input ""))
-                                   :output :string :error-output :string
-                                   :ignore-error-status t)
-               (values output error-output status)))
-        (delete-private-files private-files))
-      (run-command-asynchronously arguments input private-files watch)))
+is called with each new piece of the output as it arrives, which also makes the
+command polled rather than waited on."
+  (cond
+    (watch (run-command-watched arguments input private-files watch))
+    ((null *input-poll*)
+     ;; Nothing to service: let UIOP wait for the child itself.
+     (unwind-protect
+          (progn
+            (write-private-files private-files)
+            (multiple-value-bind (output error-output status)
+                (uiop:run-program arguments
+                                :input (make-string-input-stream (or input ""))
+                                :output :string :error-output :string
+                                :ignore-error-status t)
+              (values output error-output status)))
+       (delete-private-files private-files)))
+    (t (run-command-watched arguments input private-files nil))))
