@@ -197,20 +197,7 @@ remember it as the provider of this session."
 (defun adopt-safeai-client (client model)
   "Point CLIENT at Safe AI Labs Chat Completions with MODEL, and remember it as
 the provider of this session."
-  (let ((effort (client-effort client)))
-    (setf (client-base-url client) (trim-slashes (safeai-base-url))
-          (client-endpoint client) nil
-          (client-wire-api client) :chat-completions
-          (client-auth-provider client) :safeai
-          (client-api-key-environment client) +safeai-api-key-environment+
-          ;; Headers and request fields belonged to the previous provider; the
-          ;; ChatGPT plan's stream:true in particular would break Chat
-          ;; Completions. The thinking effort belongs to the session, so it
-          ;; stays, and is sent in the new provider's spelling.
-          (client-extra-headers client) '()
-          (client-request-fields client) nil
-          (client-model client) model)
-    (when effort (set-client-effort client effort)))
+  (configure-client-for-safeai client model)
   (remember-client client)
   client)
 
@@ -232,29 +219,152 @@ the provider of this session."
   (format nil "Usage: /login PROVIDER or /logout PROVIDER, where PROVIDER is one of:~:{~%  ~A~16T~*~A~}"
           *login-providers*))
 
+(defun configure-client-for-safeai (client model)
+  "Point CLIENT at Safe AI Labs Chat Completions with MODEL, keeping the
+session's thinking effort."
+  (let ((effort (client-effort client)))
+    (setf (client-base-url client) (trim-slashes (safeai-base-url))
+          (client-endpoint client) nil
+          (client-wire-api client) :chat-completions
+          (client-auth-provider client) :safeai
+          (client-api-key-environment client) +safeai-api-key-environment+
+          ;; Headers and request fields belonged to the previous provider; the
+          ;; ChatGPT plan's stream:true in particular would break Chat
+          ;; Completions. The thinking effort belongs to the session, so it
+          ;; stays, and is sent in the new provider's spelling.
+          (client-extra-headers client) '()
+          (client-request-fields client) nil
+          (client-model client) model)
+    (when effort (set-client-effort client effort)))
+  client)
+
+(defun provider-display-name (keyword)
+  "The name /model and /login print for provider KEYWORD."
+  (or (first (find keyword *login-providers* :key #'second))
+      (if keyword (string-downcase (symbol-name keyword)) "this session")))
+
+(defvar *model-credential-environment* #'environment-value
+  "The lookup /model uses to see whether a provider's key is in the environment;
+tests replace it.")
+
+(defun login-provider-saved-p
+    (keyword &optional (environment #'environment-value))
+  "True when /model may use login provider KEYWORD: its credential is saved."
+  (case keyword
+    (:openai (openai-login-saved-p))
+    (:safeai (safeai-login-saved-p environment))
+    (t nil)))
+
+(defun login-provider-client (keyword base)
+  "A copy of BASE pointed at login provider KEYWORD, with no model chosen yet.
+The compact model is dropped, because it belongs to the provider it was set for."
+  (let ((client
+          (ecase keyword
+            (:openai
+             (let ((client (configure-client-for-openai-oauth (copy-client base))))
+               (setf (client-model client) "")
+               client))
+            (:safeai (configure-client-for-safeai (copy-client base) "")))))
+    (setf (client-compact-model client) nil)
+    client))
+
+(defun provider-clients (agent)
+  "The (KEYWORD . CLIENT) pairs /model works with: every signed-in provider,
+with the session's own provider first. The session's provider is listed even
+when its credential comes from the environment rather than a saved login."
+  (let* ((current (agent-client agent))
+         (current-keyword (client-auth-provider current))
+         (pairs (list (cons current-keyword current))))
+    (dolist (entry *login-providers* (nreverse pairs))
+      (let ((keyword (second entry)))
+        (unless (eq keyword current-keyword)
+          (when (login-provider-saved-p keyword *model-credential-environment*)
+            (push (cons keyword (login-provider-client keyword current))
+                  pairs)))))))
+
+(defvar *model-lister* #'list-provider-models
+  "The function /model calls for a provider's model catalog; tests replace it.")
+
+(defun provider-model-catalog (client keyword)
+  "CLIENT's model catalog, or an error naming the provider KEYWORD."
+  (handler-case (funcall *model-lister* client)
+    (error (condition)
+      (error "Could not list ~A's models: ~A" (provider-display-name keyword)
+             condition))))
+
 (defun print-model-catalog (agent)
+  "Show every provider this installation is signed in to, with its models and
+the one this session uses."
   (status-bar-hide)
-  (let* ((client (agent-client agent))
-         (models (list-provider-models client)))
-    (format t "~&Current model: ~A~%~A~%"
-            (client-model client)
-            (styled :dim (format nil "Available from ~A:" (client-base-url client))))
-    (dolist (model models)
-      (format t "  ~A~@[ ~A~]~%" (car model)
-              (unless (string= (car model) (cdr model))
-                (styled :dim (format nil "— ~A" (cdr model))))))
-    models))
+  (let* ((current (agent-client agent))
+         (keyword (client-auth-provider current)))
+    (format t "~&Current model: ~A~@[ from ~A~]~%"
+            (client-model current)
+            (and keyword (provider-display-name keyword)))
+    (dolist (pair (provider-clients agent))
+      (let* ((client (cdr pair))
+             (here (eq client current)))
+        (format t "~&~:[ ~;*~] ~A~8T~A~%"
+                here (provider-display-name (car pair))
+                (styled :dim (client-base-url client)))
+        (handler-case
+            (dolist (model (funcall *model-lister* client))
+              (format t "~&~A    ~A~@[ ~A~]~%"
+                      (if (and here (string= (car model) (client-model current)))
+                          ">" " ")
+                      (car model)
+                      (unless (string= (car model) (cdr model))
+                        (styled :dim (format nil "— ~A" (cdr model))))))
+          (error (condition)
+            (format t "~&     ~A~%"
+                    (styled :error (format nil "could not list models: ~A"
+                                           condition)))))))
+    t))
 
 (defun select-model (agent model-id)
+  "The /model MODEL command: choose MODEL, switching to another signed-in
+provider when only it offers the model. A provider's own name chooses that
+provider and keeps the current model when the provider lists it."
   (status-bar-hide)
   (when (zerop (length model-id))
-    (error "Usage: /model MODEL"))
-  (let ((models (list-provider-models (agent-client agent))))
-    (unless (find model-id models :key #'car :test #'string=)
-      (error "Model ~S is not available from the current provider." model-id))
-    (setf (client-model (agent-client agent)) model-id)
+    (error "Usage: /model MODEL, or /model PROVIDER"))
+  (let* ((pairs (provider-clients agent))
+         (current (agent-client agent))
+         (current-pair (find current pairs :key #'cdr))
+         (named (find model-id pairs
+                      :key (lambda (pair) (provider-display-name (car pair)))
+                      :test #'string-equal))
+         (chosen nil))
+    (cond
+      (named
+       (let* ((models (provider-model-catalog (cdr named) (car named)))
+              (model (or (find (client-model current) models
+                               :key #'car :test #'string=)
+                         (caar models))))
+         (unless model
+           (error "~A lists no models." (provider-display-name (car named))))
+         (setf (client-model (cdr named)) model
+               chosen named)))
+      (t
+       ;; Search this session's provider first, then the others.
+       (dolist (pair (if current-pair
+                         (cons current-pair (remove current-pair pairs))
+                         pairs))
+         (let ((models (handler-case (funcall *model-lister* (cdr pair))
+                         (error () nil))))
+           (when (find model-id models :key #'car :test #'string=)
+             (setf (client-model (cdr pair)) model-id
+                   chosen pair)
+             (return))))))
+    (unless chosen
+      (error "Model ~S is not available from ~{~A~^, ~}." model-id
+             (mapcar (lambda (pair) (provider-display-name (car pair))) pairs)))
+    (setf (agent-client agent) (cdr chosen))
     (remember-client (agent-client agent))
-    (format t "~A~%" (styled :dim (format nil "Selected model: ~A" model-id)))))
+    (format t "~&~A~%"
+            (styled :dim (format nil "Selected ~A from ~A."
+                                 (client-model (cdr chosen))
+                                 (provider-display-name (car chosen)))))))
 
 ;;; Thinking effort
 
@@ -377,8 +487,9 @@ QUIET. True unless saving failed."
   "/login openai  sign in with ChatGPT OAuth
 /login safeai  save a Safe AI Labs API key
 /logout NAME   forget a saved login
-/model         list current provider's available models
-/model MODEL   select an available model
+/model         list signed-in providers, their models, and the current one
+/model MODEL   select a model, switching provider when only it offers it
+/model PROVIDER  switch to a signed-in provider (openai, safeai)
 /effort        show the model's thinking effort
 /effort LEVEL  set it: none, minimal, low, medium, or high
 /statusbar     show or hide the status bar above the prompt

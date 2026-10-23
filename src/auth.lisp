@@ -30,8 +30,12 @@
     (or (environment-pathname "XDG_CONFIG_HOME")
         (merge-pathnames ".config/" (user-homedir-pathname)))))
 
+(defvar *auth-file* nil
+  "When non-NIL, the file holding the OpenAI OAuth credential.")
+
 (defun auth-file-path ()
-  (or (environment-pathname "MAXWELL_AUTH_FILE")
+  (or *auth-file*
+      (environment-pathname "MAXWELL_AUTH_FILE")
       (merge-pathnames "maxwell/openai-auth.json" (config-directory))))
 
 (defun random-octets (count)
@@ -781,3 +785,21 @@ owner-only. Returns the model to use: MAXWELL_SAFEAI_MODEL or the first listed."
   (when (probe-file path)
     (delete-file path)
     t))
+
+;;; Which providers this installation can use: /model lists these and can
+;;; switch between them.
+
+(defun openai-login-saved-p (&optional (path (auth-file-path)))
+  "True when a saved ChatGPT login can still supply an access token."
+  (let ((record (handler-case (load-auth-record path) (error () nil))))
+    (and (hash-table-p record)
+         (let ((token (or (get-key record "access_token")
+                          (get-key record "refresh_token"))))
+           (and (stringp token) (plusp (length token)))))))
+
+(defun safeai-login-saved-p (&optional (environment #'environment-value))
+  "True when a Safe AI Labs key is saved or set in the environment."
+  (handler-case
+      (let ((key (safeai-api-key :environment environment)))
+        (and (stringp key) (plusp (length key)) t))
+    (error () nil)))

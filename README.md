@@ -189,13 +189,22 @@ API keys and OAuth tokens reach `curl` through a short-lived owner-only header
 file rather than its command line, so other local users cannot read them with
 `ps`.
 
-Inside Maxwell, `/model` fetches the current account/provider catalog and shows
-the selected model. Use `/model MODEL` to switch, for example:
+Inside Maxwell, `/model` lists every provider this installation is signed in to,
+marks the one the session uses, and shows each provider's model catalog with the
+selected model. `/model MODEL` switches to that model, moving to another signed-in
+provider when only it offers the model, and `/model PROVIDER` switches provider,
+keeping the current model when the new provider lists it:
 
 ```text
 /model
 /model gpt-6.1-sol
+/model safeai
 ```
+
+A provider counts as signed in when its login is saved (`/login openai`,
+`/login safeai`) or its key is in the environment; the session's own provider is
+always listed. Pressing `/model` fetches each catalog live, so a provider that
+cannot be reached is reported without hiding the others.
 
 ### Remembering the last provider and model
 

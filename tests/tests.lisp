@@ -226,6 +226,81 @@
     (check (eq t (maxwell/json:get-key fields "stream")))
     (check (null (maxwell/json:get-key fields "store")))))
 
+(defun test-provider-switching ()
+  ;; /model lists every signed-in provider and switches between them.
+  (let* ((session (temporary-test-path "model-session"))
+         (auth (temporary-test-path "model-openai"))
+         (safeai (temporary-test-path "model-safeai"))
+         (maxwell::*session-file* session)
+         (maxwell::*auth-file* auth)
+         (maxwell::*safeai-auth-file* safeai)
+         (maxwell::*model-lister*
+           (lambda (client)
+             (case (maxwell::client-auth-provider client)
+               (:openai '(("gpt-a" . "GPT A") ("gpt-b" . "GPT B")))
+               (:safeai '(("deepseek/x" . "deepseek/x")))
+               (t '(("only" . "only"))))))
+         (maxwell::*model-credential-environment* (constantly nil)))
+    (unwind-protect
+         (flet ((agent (client) (maxwell:make-agent :client client))
+                (catalog (agent)
+                  (let ((maxwell::*color* nil))
+                    (with-output-to-string (out)
+                      (let ((*standard-output* out))
+                        (maxwell::print-model-catalog agent)))))
+                (select (agent model)
+                  (let ((maxwell::*color* nil))
+                    (with-output-to-string (out)
+                      (let ((*standard-output* out))
+                        (maxwell::select-model agent model))))))
+           (let ((agent (agent (maxwell:make-client :auth-provider :openai
+                                                    :model "gpt-a"))))
+             ;; With no saved Safe AI Labs key, only this session's provider shows.
+             (let ((text (catalog agent)))
+               (check (search "gpt-a" text))
+               (check (search "gpt-b" text))
+               (check (not (search "safeai" text))))
+             ;; Saving credentials makes the other provider appear too.
+             (maxwell::write-private-json-file
+               (maxwell/json:json-object "access_token" "test-token")
+               auth)
+             (maxwell::write-private-json-file
+               (maxwell/json:json-object "api_key" "sail_test")
+               safeai)
+             (let ((text (catalog agent)))
+               (check (search "openai" text))
+               (check (search "safeai" text))
+               (check (search "deepseek/x" text)))
+             ;; A model only the other provider lists switches to it.
+             (check (search "deepseek/x" (select agent "deepseek/x")))
+             (check (eq :safeai (maxwell::client-auth-provider
+                                  (maxwell::agent-client agent))))
+             (check (string= "deepseek/x" (maxwell:client-model
+                                              (maxwell::agent-client agent))))
+             (check (string= "safeai"
+                             (maxwell/json:get-key
+                               (maxwell/json:get-key (maxwell::load-session-record)
+                                                     "provider")
+                               "auth_provider")))
+             ;; Naming a provider returns to it, keeping a model it lists.
+             (check (search "gpt-a" (select agent "openai")))
+             (check (eq :openai (maxwell::client-auth-provider
+                                  (maxwell::agent-client agent))))
+             (check (string= "gpt-a" (maxwell:client-model
+                                         (maxwell::agent-client agent))))
+             ;; A model no signed-in provider lists is an error naming them all.
+             (check (signals-message-p (lambda () (select agent "nope/model"))
+                                       "nope/model" "openai" "safeai")))
+           ;; A key in the environment counts as signed in too.
+           (let* ((maxwell::*model-credential-environment*
+                    (lambda (name)
+                      (and (string= name "SAFEAILABS_API_KEY") "sail_env")))
+                  (agent (agent (maxwell:make-client :auth-provider :openai
+                                                     :model "gpt-a"))))
+             (check (search "deepseek/x" (catalog agent)))))
+      (dolist (path (list session auth safeai))
+        (when (probe-file path) (delete-file path))))))
+
 (defun test-model-catalog ()
   (let* ((response
            (maxwell/json:json-object
@@ -952,6 +1027,7 @@
     (test-auth-encoding)
     (test-openai-client-contract)
     (test-model-catalog)
+    (test-provider-switching)
     (test-session-memory)
     (test-safeai-credentials)
     (test-safeai-key-checks)
