@@ -295,7 +295,7 @@ when its credential comes from the environment rather than a saved login."
 (defun print-model-catalog (agent)
   "Show every provider this installation is signed in to, with its models and
 the one this session uses."
-  (status-bar-hide)
+  (ui-call #'status-bar-hide)
   (let* ((current (agent-client agent))
          (keyword (client-auth-provider current)))
     (format t "~&Current model: ~A~@[ from ~A~]~%"
@@ -321,11 +321,53 @@ the one this session uses."
                                            condition)))))))
     t))
 
+(defun run-model-command (agent &optional model-id)
+  (let ((text (call-with-command-prompt
+                agent (lambda () (%run-model-command agent model-id)))))
+    (write-string text)))
+
+(defun %run-model-command (agent &optional model-id)
+  "Fetch models off the UI thread, pumping queued UI work until completion."
+  (status-bar-hide)
+  (let ((output nil) (failure nil)
+        (done (bt:make-semaphore :count 0))
+        (worker nil))
+    (unwind-protect
+         (progn
+           (setf worker
+                 (start-worker
+                   "maxwell model catalog"
+                   (lambda ()
+                     (unwind-protect
+                          (handler-case
+                              (setf output
+                                    (with-output-to-string (*standard-output*)
+                                      (if model-id (select-model agent model-id)
+                                          (print-model-catalog agent))))
+                            (error (condition) (setf failure condition)))
+                       (bt:signal-semaphore done)))
+                   :bindings (list (cons '*ui-thread* *ui-thread*)
+                                   (cons '*model-lister* *model-lister*)
+                                   (cons '*model-credential-environment* *model-credential-environment*)
+                                   (cons '*auth-file* *auth-file*)
+                                   (cons '*safeai-auth-file* *safeai-auth-file*)
+                                   (cons '*session-file* *session-file*)
+                                   (cons '*color* *color*))))
+           (loop until (bt:wait-on-semaphore done :timeout 0.01)
+                 do (service-ui)
+                    (when (take-interrupt) (error "Model lookup interrupted.")))
+           (worker-join worker)
+           (when failure (error failure))
+           output)
+      (when (worker-alive-p worker)
+        (bt:destroy-thread (worker-thread worker))
+        (worker-join worker)))))
+
 (defun select-model (agent model-id)
   "The /model MODEL command: choose MODEL, switching to another signed-in
 provider when only it offers the model. A provider's own name chooses that
 provider and keeps the current model when the provider lists it."
-  (status-bar-hide)
+  (ui-call #'status-bar-hide)
   (when (zerop (length model-id))
     (error "Usage: /model MODEL, or /model PROVIDER"))
   (let* ((pairs (provider-clients agent))
@@ -338,8 +380,8 @@ provider and keeps the current model when the provider lists it."
     (cond
       (named
        (let* ((models (provider-model-catalog (cdr named) (car named)))
-              (model (or (find (client-model current) models
-                               :key #'car :test #'string=)
+              (model (or (car (find (client-model current) models
+                               :key #'car :test #'string=))
                          (caar models))))
          (unless model
            (error "~A lists no models." (provider-display-name (car named))))
@@ -577,12 +619,12 @@ handler. The UI thread has already been claimed by MAIN."
            (error (condition)
              (report-error "Logout failed: ~A" condition))))
         ((command-p line "/model")
-         (handler-case (print-model-catalog *agent*)
+         (handler-case (run-model-command *agent*)
            (error (condition)
              (report-error "Could not list models: ~A" condition))))
         ((command-argument line "/model ")
          (handler-case
-             (select-model *agent* (command-argument line "/model "))
+             (run-model-command *agent* (command-argument line "/model "))
            (error (condition)
              (report-error "Could not select model: ~A" condition))))
         ((or (command-p line "/statusbar")
@@ -620,7 +662,9 @@ handler. The UI thread has already been claimed by MAIN."
                (format t "Usage: /save PATH~%")
                ;; The snapshot ends the process: save the global chat first.
                (when (save-session)
-                 (save-image (namestring (workspace-path path)))))))
+                 (handler-case (save-image (namestring (workspace-path path)))
+                   (error (condition)
+                     (report-error "Could not save image: ~A" condition)))))))
         ((zerop (length (string-trim '(#\Space #\Tab) line))))
         (t
          (handler-case (run-interactive-turn line *agent*)

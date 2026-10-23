@@ -763,6 +763,40 @@ HTTP status in curl OUTPUT suggests a bad model and the catalog lacks it."
                                          (provider-error-message condition) note))
         condition)))
 
+(defun sse-generated-output-p (wire-api name data)
+  "True only for generated text, reasoning, or tool output, not SSE framing."
+  (let ((event (ignore-errors (decode data))))
+    (when (hash-table-p event)
+      (if (eq wire-api :responses)
+          (let ((type (or (get-key event "type") name))
+                (delta (get-key event "delta")))
+            (or (and (member type '("response.output_text.delta"
+                                   "response.reasoning_summary_text.delta"
+                                   "response.reasoning_text.delta"
+                                   "response.function_call_arguments.delta")
+                             :test #'equal)
+                     (stringp delta) (plusp (length delta)))
+                (and (equal type "response.output_item.added")
+                     (equal (get-key (get-key event "item") "type")
+                            "function_call"))))
+          (let ((choices (get-key event "choices")))
+            (and (vectorp choices)
+                 (loop for choice across choices
+                       for delta = (get-key choice "delta")
+                       thereis
+                       (or (loop for key in '("content" "reasoning_content" "reasoning")
+                                 for text = (get-key delta key)
+                                 thereis (and (stringp text) (plusp (length text))))
+                           (let ((calls (get-key delta "tool_calls")))
+                             (and (vectorp calls) (plusp (length calls))))))))))))
+
+(defun request-sse-handler (stat wire-api)
+  (let ((reasoning (sse-reasoning-handler wire-api)))
+    (lambda (name data)
+      (when (sse-generated-output-p wire-api name data)
+        (note-request-piece stat 1))
+      (funcall reasoning name data))))
+
 (defun post-provider (client request)
   (multiple-value-bind (arguments body streaming private-files)
       (provider-request-arguments client request)
@@ -772,16 +806,16 @@ HTTP status in curl OUTPUT suggests a bad model and the catalog lacks it."
     ;; shown as it arrives, so the model's reasoning appears while it thinks.
     (let* ((wire-api (client-wire-api client))
            (reader (and streaming (%make-sse-reader)))
-           (handler (and reader (sse-reasoning-handler wire-api)))
-           ;; Measure the request: the time to the first streamed piece, the
+           ;; Measure the request: the time to the first generated output, the
            ;; total time, and the token counts the provider reports.
-           (stat (request-stat-begin (client-model client) wire-api)))
+           (stat (request-stat-begin (client-model client) wire-api))
+           (handler (and reader (request-sse-handler stat wire-api))))
       (multiple-value-bind (output error-output status)
           (run-command arguments :input body :private-files private-files
                        :watch (and reader
                                    (lambda (chunk)
-                                     (note-request-piece stat (length chunk))
                                      (sse-reader-feed reader chunk handler))))
+        (when reader (sse-reader-feed reader (format nil "~%~%") handler))
         (let ((response
                 (handler-case
                     (parse-provider-output output error-output status streaming

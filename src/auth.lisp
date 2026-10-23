@@ -1,7 +1,8 @@
 (in-package #:maxwell)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (require :sb-bsd-sockets))
+  (require :sb-bsd-sockets)
+  (require :sb-posix))
 
 (defparameter +openai-authorize-url+
   "https://auth.openai.com/api/accounts/authorize")
@@ -192,6 +193,15 @@
   (uiop:run-program (list "chmod" "600" (namestring path))
                     :output nil :error-output nil))
 
+(defun open-private-output (path)
+  "Exclusively create PATH with mode 0600, without a public-file window."
+  (let ((fd (sb-posix:open (namestring path)
+                          (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl)
+                          #o600)))
+    (handler-case
+        (sb-sys:make-fd-stream fd :output t :external-format :utf-8 :auto-close t)
+      (error (condition) (sb-posix:close fd) (error condition)))))
+
 (defun write-private-json-file (record path)
   "Atomically write RECORD to PATH as JSON readable only by its owner."
   (ensure-directories-exist path)
@@ -203,9 +213,7 @@
                          :defaults path)))
     (unwind-protect
          (progn
-           (with-open-file (stream temporary :direction :output
-                                             :if-exists :error
-                                             :if-does-not-exist :create)
+           (with-open-stream (stream (open-private-output temporary))
              (write-string (encode record) stream)
              (terpri stream))
            (protect-file temporary)

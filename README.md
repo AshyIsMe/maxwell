@@ -255,7 +255,8 @@ the provider. Without it Maxwell uses the main model and says once that this
 may cost more.
 
 Every model request is measured. `/stats` lists the recent ones, newest first:
-the time to the first streamed piece, the total response time, the output
+the time to the first generated text, reasoning, or tool-call delta (not SSE
+keep-alives or metadata), the total response time, the output
 tokens per second, and the token counts the provider reported -- input, output,
 and how many of the output tokens were reasoning. Chat Completions requests ask
 for a usage report (`stream_options.include_usage`); when a provider reports
@@ -291,12 +292,25 @@ make build
 Terminal behaviour is covered by pty tests that drive the built executable:
 `python3 tests/terminal-pty.py` for editing, history, Ctrl-T, colour, and
 settings restoration; `python3 tests/terminal-pty-steering.py` for browsing,
-steering, and Ctrl-C during a request (it serves a deliberately slow fake
+steering, slow model lookups, and Ctrl-C during a request (it serves a deliberately slow fake
 provider on a local port); `python3 tests/thinking-pty.py` for a provider that
 streams its reasoning, which is served on a local port too; and
 `python3 tests/checkpoint-pty.py` for saving, restarting, the lock, and moving
 the chat between builds. All of them keep their images, sessions, and logins in
 a temporary directory.
+
+The separate-image save paths have a subprocess integration check:
+
+```sh
+sbcl --script tests/image-save.lisp /tmp/maxwell-save-test.image
+/tmp/maxwell-save-test.image --help
+sbcl --script tests/image-save.lisp /tmp/maxwell-save-test.image request
+/tmp/maxwell-save-test.image --help
+rm /tmp/maxwell-save-test.image
+```
+
+It checks failed-save recovery and saving with a live compactor, both directly
+and via `request-image`.
 
 ### Vendored libraries
 

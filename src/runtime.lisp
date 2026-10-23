@@ -201,16 +201,7 @@ a second value whether evaluation signalled an error."
 (defun save-image (path &key (executable t))
   "Save the entire running Maxwell state and terminate this SBCL process."
   #+sbcl
-  (progn
-    (setf *pending-image* nil)
-    (forget-session-state)
-    (ensure-directories-exist path)
-    (format t "~&Saving Maxwell image to ~A~%" path)
-    (finish-output)
-    (sb-ext:save-lisp-and-die path
-                              :executable executable
-                              :save-runtime-options t
-                              :toplevel #'image-main))
+  (%save-image path executable)
   #-sbcl
   (declare (ignore path executable))
   #-sbcl

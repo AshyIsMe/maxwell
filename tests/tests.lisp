@@ -288,7 +288,11 @@
                                   (maxwell::agent-client agent))))
              (check (string= "gpt-a" (maxwell:client-model
                                          (maxwell::agent-client agent))))
-             ;; A model no signed-in provider lists is an error naming them all.
+             ;; Naming the current provider keeps the ID string, not a catalog cons.
+              (check (search "gpt-a" (select agent "openai")))
+              (check (string= "gpt-a" (maxwell:client-model
+                                         (maxwell::agent-client agent))))
+              ;; A model no signed-in provider lists is an error naming them all.
              (check (signals-message-p (lambda () (select agent "nope/model"))
                                        "nope/model" "openai" "safeai")))
            ;; A key in the environment counts as signed in too.
@@ -1028,6 +1032,7 @@
     (test-openai-client-contract)
     (test-model-catalog)
     (test-provider-switching)
+    (test-review-regressions)
     (test-session-memory)
     (test-safeai-credentials)
     (test-safeai-key-checks)
@@ -1061,3 +1066,83 @@
             (zerop *failures*) *failures*)
     (zerop *failures*)))
 
+
+(defun test-review-regressions ()
+  ;; A catalog lookup runs on a worker and can synchronously ask the UI to
+  ;; service work without freezing it. No provider network access in this test.
+  (let* ((maxwell::*ui-thread* (bt:current-thread))
+         (maxwell::*auth-file* (temporary-test-path "no-openai"))
+         (maxwell::*safeai-auth-file* (temporary-test-path "no-safeai"))
+         (maxwell::*model-credential-environment* (constantly nil))
+         (serviced nil)
+         (maxwell::*model-lister*
+           (lambda (client)
+             (declare (ignore client))
+             (check (not (maxwell::ui-thread-p)))
+             (maxwell::ui-call (lambda () (setf serviced t)))
+             '(("test-model" . "test-model"))))
+         (agent (maxwell:make-agent :client (maxwell:make-client
+                                            :auth-provider :openai :model "test-model"))))
+    (check (search "test-model"
+                   (with-output-to-string (*standard-output*)
+                     (maxwell::run-model-command agent))))
+    (check serviced)
+    (check (null (maxwell::live-workers))))
+
+  ;; Functions returned by UI work are data, not exception trampolines.
+  (let* ((maxwell::*ui-thread* (bt:current-thread))
+         (fn (lambda () (error "must not execute")))
+         (result nil)
+         (worker (maxwell::start-worker
+                   "function result"
+                   (lambda ()
+                     (setf result
+                           (list (multiple-value-list (maxwell::ui-call (lambda () fn)))
+                                 (multiple-value-list
+                                   (maxwell::ui-call (lambda () (values fn :second)))))))
+                   :bindings (list (cons 'maxwell::*ui-thread* maxwell::*ui-thread*)))))
+    (maxwell::worker-join worker)
+    (check (eq fn (first (first result))))
+    (check (equal (list fn :second) (second result))))
+  ;; All subprocess and credential files start private, even under umask 0.
+  (let* ((old-mask (sb-posix:umask 0))
+         (path (temporary-test-path "private"))
+         (job nil))
+    (unwind-protect
+         (progn
+           (maxwell::write-private-json-file (maxwell/json:json-object "key" "test") path)
+           (check (= #o600 (logand #o777 (sb-posix:stat-mode (sb-posix:stat path)))))
+           (setf job (maxwell::start-command '("/bin/cat") :input "private conversation"))
+           (loop until (maxwell::command-finished-p job) do (sleep 0.01))
+           (dolist (file (list (maxwell::command-job-input-path job)
+                              (maxwell::command-job-output-path job)
+                              (maxwell::command-job-error-path job)))
+             (check (= #o600 (logand #o777 (sb-posix:stat-mode (sb-posix:stat file))))))
+           (check (string= "private conversation" (maxwell::finish-command job)))
+           (setf job nil))
+      (when job (maxwell::cancel-command job))
+      (when (probe-file path) (delete-file path))
+      (sb-posix:umask old-mask)))
+  ;; The final output must reach WATCH even when the child exits between polls.
+  (let ((seen "") (maxwell::*command-poll-interval* 0.1))
+    (multiple-value-bind (output err code)
+        (maxwell::run-command '("/bin/echo" "last chunk")
+                              :watch (lambda (chunk) (setf seen (concatenate 'string seen chunk))))
+      (declare (ignore err))
+      (check (zerop code))
+      (check (string= output seen))))
+  ;; SSE framing, role-only deltas and usage events are not model tokens.
+  (dolist (wire '(:chat-completions :responses))
+    (let* ((stat (maxwell::request-stat-begin "test" wire))
+           (reader (maxwell::%make-sse-reader))
+           (handler (maxwell::request-sse-handler stat wire)))
+      (maxwell::sse-reader-feed reader (format nil ": keep-alive~%~%") handler)
+      (funcall handler nil "{\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}")
+      (funcall handler nil "{\"type\":\"response.created\"}")
+      (funcall handler nil "{\"choices\":[],\"usage\":{}}")
+      (check (null (maxwell::request-stat-first-real stat)))
+      (funcall handler nil
+               (if (eq wire :responses)
+                   "{\"type\":\"response.output_text.delta\",\"delta\":\"x\"}"
+                   "{\"choices\":[{\"delta\":{\"content\":\"x\"}}]}"))
+      (check (maxwell::request-stat-first-real stat)))))

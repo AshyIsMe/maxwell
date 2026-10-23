@@ -1,7 +1,7 @@
 (in-package #:maxwell)
 
 ;;; Per-request statistics. Every model request a turn makes is measured: the
-;;; time to the first streamed piece, the total response time, and the token
+;;; time to the first generated output, the total response time, and the token
 ;;; counts the provider reports in its usage -- input, output, and the reasoning
 ;;; part of the output. When a provider reports no usage, the output tokens are
 ;;; estimated from the reply's size and marked as such. *REQUEST-STATS* keeps
@@ -30,7 +30,7 @@ the retention time, so an extremely busy month cannot grow without bound.")
   wire-api
   started          ; universal time of the request
   (real-start 0)   ; internal real time at the start
-  first-real       ; internal real time of the first streamed piece
+  first-real       ; internal real time of the first generated output
   (latency nil)    ; seconds to the first piece, when it was measured
   (total nil)      ; seconds for the whole reply
   prompt-tokens
@@ -50,7 +50,7 @@ the retention time, so an extremely busy month cannot grow without bound.")
 
 (defun note-request-piece (stat size)
   "Record a streamed piece of SIZE bytes for STAT, keeping the time of the
-first non-empty one as the request's latency."
+first non-empty generated piece as the request's latency."
   (when (and stat (null (request-stat-first-real stat)) (plusp size))
     (setf (request-stat-first-real stat) (get-internal-real-time)))
   stat)

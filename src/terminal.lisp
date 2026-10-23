@@ -430,3 +430,29 @@ runs work queued by workers while it waits."
             (when line (remember-prompt line))
             line)))))
 
+
+(defun call-with-command-prompt (agent function)
+  "Keep browsing, toggling and draft editing live during a background command."
+  (let ((state (interactive-terminal-state)))
+    (if (null state)
+        (funcall function)
+        (let ((editor (make-prompt-editor agent *standard-input* *standard-output*
+                                          :prompt "models> " :text *prompt-draft*)))
+          (unwind-protect
+               (progn
+                 (terminal-command "-icanon" "-echo" "min" "1" "time" "0")
+                 (editor-redraw editor)
+                 (let ((*ui-service*
+                         (lambda ()
+                           (loop while (listen *standard-input*)
+                                 for key = (terminal-key *standard-input*)
+                                 do (case (editor-key editor key)
+                                      (:browse (browse-transcript *standard-input* *standard-output*))
+                                      (:toggle (toggle-tool-display)
+                                       (redraw-transcript *standard-output*))
+                                      ((:interrupt :cancel) (error "Model lookup interrupted.")))
+                                    (editor-redraw editor)))))
+                   (funcall function)))
+            (editor-erase editor)
+            (setf *prompt-draft* (prompt-editor-text editor))
+            (terminal-command state))))))

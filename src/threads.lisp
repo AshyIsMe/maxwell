@@ -53,6 +53,7 @@ image does when it resumes."
   (lock (bt:make-lock "maxwell ui job"))
   (condition (bt:make-condition-variable :name "maxwell ui job"))
   (done nil)
+  error
   (values '()))
 
 (defun ui-post (function)
@@ -91,18 +92,20 @@ waiting for a thread that will never answer."
             (release-ui-thread)
             (return-from ui-call (funcall function))))
         (let ((values (ui-job-values job)))
-          (if (and values (functionp (first values)))
-              (funcall (first values))
+          (if (ui-job-error job)
+              (error (ui-job-error job))
               (values-list values))))))
 
 (defun run-ui-job (job)
   "Run JOB's function on the UI thread and hand its outcome to the waiter.
 A UI failure is re-signalled on the worker that asked for the job, where the
 turn's own error handling sees it."
-  (let ((values (handler-case (multiple-value-list (funcall (ui-job-function job)))
-                  (error (condition) (list (lambda () (error condition)))))))
+  (let* ((failure nil)
+         (values (handler-case (multiple-value-list (funcall (ui-job-function job)))
+                   (error (condition) (setf failure condition) nil))))
     (bt:with-lock-held ((ui-job-lock job))
-      (setf (ui-job-values job) values
+      (setf (ui-job-error job) failure
+            (ui-job-values job) values
             (ui-job-done job) t)
       (bt:condition-notify (ui-job-condition job)))
     (values-list values)))
@@ -182,17 +185,18 @@ the bar is drawn there."
 is an alist of (SPECIAL . VALUE) bound around FUNCTION: a new thread inherits
 no dynamic bindings, so whoever starts a worker hands it the state its work
 depends on."
-  (let ((worker nil))
-    (setf worker
-          (register-worker
-            (%make-worker
-              :name name
-              :thread (bt:make-thread
-                        (lambda ()
-                          (progv (mapcar #'car bindings) (mapcar #'cdr bindings)
-                            (unwind-protect (funcall function)
-                              (unregister-worker worker))))
-                        :name name))))
+  (let* ((worker (%make-worker :name name))
+         (gate (bt:make-semaphore :count 0)))
+    (setf (worker-thread worker)
+          (bt:make-thread
+            (lambda ()
+              (bt:wait-on-semaphore gate)
+              (progv (mapcar #'car bindings) (mapcar #'cdr bindings)
+                (unwind-protect (funcall function)
+                  (unregister-worker worker))))
+            :name name))
+    (register-worker worker)
+    (bt:signal-semaphore gate)
     worker))
 
 (defun worker-alive-p (worker)
@@ -307,7 +311,7 @@ first, so QUIESCE-WORKERS does not wait for it again."
                          (round (* timeout internal-time-units-per-second)))))
         (loop while (and (worker-alive-p worker)
                          (< (get-internal-real-time) deadline))
-              do (sleep 0.02)))
+              do (ui-yield 0.02)))
       ;; A tick that will not end, such as a slow provider request, cannot survive
       ;; the fork, so it is stopped outright.
       (when (worker-alive-p worker)

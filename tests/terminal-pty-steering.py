@@ -41,6 +41,14 @@ def reply(handler, payload, status=200):
 
 
 class Provider(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        # A slow catalog must not freeze browsing, drafts, or cancellation.
+        time.sleep(thinking_seconds)
+        try:
+            reply(self, {'data': [{'id': 'pty-model'}, {'id': 'pty-other'}]})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_POST(self):
         length = int(self.headers.get('Content-Length', 0))
         request = json.loads(self.rfile.read(length))
@@ -84,6 +92,9 @@ if pid == 0:
     os.environ['TERM'] = 'xterm'
     # Never touch the developer's real remembered session or image.
     os.environ['MAXWELL_SESSION_FILE'] = os.path.join(scratch, 'session.json')
+    os.environ['MAXWELL_AUTH_FILE'] = os.path.join(scratch, 'openai.json')
+    os.environ['MAXWELL_SAFEAI_AUTH_FILE'] = os.path.join(scratch, 'safeai.json')
+    os.environ.pop('SAFEAILABS_API_KEY', None)
     os.environ['MAXWELL_IMAGE'] = os.path.join(scratch, 'maxwell.image')
     os.environ['XDG_DATA_HOME'] = os.path.join(scratch, 'data')
     # Plain text keeps the markers below contiguous.
@@ -122,6 +133,27 @@ def steering_messages(request):
 
 
 try:
+    expect(b'maxwell> ')
+
+    # Catalog IO runs off the UI thread, while editing and Ctrl-T still work.
+    send(b'/model' + ENTER)
+    expect(b'models> ')
+    send(CTRL_T)
+    expect(b'\x1b[H\x1b[2J\x1b[3J')
+    expect(b'models> ')
+    send(b'draft')
+    expect(b'models> draft')
+    expect(b'pty-other')
+    expect(b'maxwell> draft')
+    send(bytes([21]))  # Ctrl-U: clear the preserved draft.
+    # Restore collapsed tools, which the remaining checks assume.
+    send(CTRL_T)
+    expect(b'maxwell> ')
+
+    send(b'/model' + ENTER)
+    expect(b'models> ')
+    send(bytes([3]))
+    expect(b'Model lookup interrupted.')
     expect(b'maxwell> ')
 
     # Start a request, then use the terminal while the model is still working.

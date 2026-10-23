@@ -345,3 +345,34 @@ load fails."
 
 
 
+
+(defun %save-image (path executable)
+  ;; A worker cannot stop itself before SBCL saves the heap.
+  (unless (ui-thread-p)
+    (error "Save images on the UI thread; use maxwell:request-image in a tool."))
+  (let ((entries nil)
+        (history nil)
+        (pending *pending-image*)
+        (restart (compactor-worker-live-p)))
+    (unwind-protect
+         (progn
+           (stop-compactor-worker)
+           (quiesce-workers)
+           (ensure-directories-exist path)
+           ;; Quiescing may have drained final UI entries from workers.
+           (setf entries (copy-seq *session-entries*)
+                 history (and *agent* (agent-history *agent*))
+                 *pending-image* nil)
+           (forget-session-state)
+           (format t "~&Saving Maxwell image to ~A~%" path)
+           (finish-output)
+           (sb-ext:save-lisp-and-die path :executable executable
+                                       :save-runtime-options t
+                                       :toplevel #'image-main))
+      ;; Reached only if saving failed: keep the live transcript intact.
+      (when entries
+        (setf (fill-pointer *session-entries*) (length entries))
+        (replace *session-entries* entries)
+        (when *agent* (setf (agent-history *agent*) history)))
+      (setf *pending-image* pending)
+      (when restart (restart-compactor-worker)))))

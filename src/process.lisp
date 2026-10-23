@@ -29,10 +29,7 @@ interactive prompt can erase its input line before other output appears.")
 (defun write-private-file (path text)
   "Create PATH readable only by its owner and write TEXT to it. The file is
 restricted before any of TEXT reaches it."
-  (with-open-file (stream path :direction :output :if-exists :error
-                               :if-does-not-exist :create
-                               :external-format :utf-8)
-    (protect-file path)
+  (with-open-stream (stream (open-private-output path))
     (write-string text stream))
   path)
 
@@ -79,15 +76,17 @@ pairs written owner-only before the command starts and deleted with the job."
                             (declare (ignore condition))
                             (delete-command-files job))))
       (write-private-files private-files)
-      (write-encoded-file (command-job-input-path job) (or input ""))
+      (write-private-file (command-job-input-path job) (or input ""))
+      (write-private-file (command-job-output-path job) "")
+      (write-private-file (command-job-error-path job) "")
       (setf (command-job-process job)
             (sb-ext:run-program (first arguments) (rest arguments)
                                 :search t
                                 :input (command-job-input-path job)
                                 :output (command-job-output-path job)
                                 :error (command-job-error-path job)
-                                :if-output-exists :supersede
-                                :if-error-exists :supersede
+                                :if-output-exists :overwrite
+                                :if-error-exists :overwrite
                                 :wait nil)))
     job))
 
@@ -158,8 +157,12 @@ polls."
                                (setf seen (length text)))))
                          (when *input-poll* (funcall *input-poll*))
                          (sleep *command-poll-interval*))
-                (multiple-value-prog1 (finish-command job)
-                  (setf finished t)))
+                (multiple-value-bind (output error-output status) (finish-command job)
+                  (setf finished t)
+                  ;; A fast child may exit between polls, including before the first.
+                  (when (and watch (> (length output) seen))
+                    (funcall watch (subseq output seen)))
+                  (values output error-output status)))
            (unless finished (cancel-command job))))
     ;; The input line must go away before the caller prints anything else.
     (when *input-hide* (funcall *input-hide*))))
