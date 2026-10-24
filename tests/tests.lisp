@@ -348,8 +348,10 @@
                       output)))
     (let ((text (get-output-stream-string output)))
       (check (search (format nil "~C[?1049h" #\Escape) text))
-      ;; The viewer draws the session's entries.
-      (check (search "› hello" text))))
+      ;; The viewer draws the session's entries. Colour may be on, as on a
+      ;; real terminal, and then the gutter is wrapped in SGR codes, so the
+      ;; entry's text is checked for itself rather than with its gutter.
+      (check (search "hello" text))))
   (let ((maxwell::*agent* nil)
         (*standard-input* (make-string-input-stream (format nil "plain~%")))
         (*standard-output* (make-string-output-stream)))
@@ -534,7 +536,10 @@
       (check (search (format nil "~C[?1049h" #\Escape) (service (format nil "~C[5~~" #\Escape))))
       (check (search (format nil "~C[?1049h" #\Escape) (service (format nil "~C[6~~" #\Escape))))
       ;; The draft survives: text typed before PgUp is still there afterwards.
-      (check (search "steer> draft" (service (format nil "draft~C[5~~" #\Escape))))
+      ;; With colour on, as on a real terminal, the prompt is wrapped in SGR
+      ;; codes, so the draft is checked for itself rather than with its prompt.
+      (let ((maxwell::*color* nil))
+        (check (search "steer> draft" (service (format nil "draft~C[5~~" #\Escape)))))
       ;; Hiding erases the line so model output starts cleanly.
       (let* ((output (make-string-output-stream))
              (session (maxwell::make-steering-session
@@ -1150,3 +1155,6 @@
                    "{\"type\":\"response.output_text.delta\",\"delta\":\"x\"}"
                    "{\"choices\":[{\"delta\":{\"content\":\"x\"}}]}"))
       (check (maxwell::request-stat-first-real stat)))))
+
+
+

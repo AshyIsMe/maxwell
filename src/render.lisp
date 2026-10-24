@@ -84,13 +84,16 @@ older than the session.")
                     :output :string :error-output :string))
 
 (defun terminal-size ()
-  "The terminal's rows and columns, or 24 and 80 when they are unknown."
+  "The terminal's rows and columns, or 24 and 80 when they are unknown.
+A pseudo-terminal that was given no size reports 0 0, which STTY accepts,
+so a size that is not positive counts as unknown too."
   (let ((size (ignore-errors
                 (mapcar #'parse-integer
-                        (remove "" (uiop:split-string (terminal-command "size"))
-                                :test #'string=)))))
-    (values (max 3 (or (first size) 24))
-            (max 2 (or (second size) 80)))))
+                        (remove "" (uiop:split-string (terminal-command "size")
+                                :test #'string=))))))
+    (flet ((known (value fallback) (if (and value (plusp value)) value fallback)))
+      (values (max 3 (known (first size) 24))
+              (max 2 (known (second size) 80))))))
 
 (defun live-width (stream)
   "The width to render rows at on STREAM: one less than the terminal's columns,
@@ -558,3 +561,4 @@ prompt line afterwards."
         (write-line (styled :dim "… earlier history: PgUp") output))
       (dolist (line lines) (write-line line output))
       (finish-output output))))
+

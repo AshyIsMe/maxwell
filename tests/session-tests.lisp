@@ -315,6 +315,11 @@ REQUESTS and answers with REPLY of the request count."
                               :effort))))
       (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore)))
   ;; Bad options make MAIN fail with status 1, and IMAGE-MAIN exits with it.
-  (let ((*error-output* (make-broadcast-stream)))
-    (check (= 1 (maxwell:main '("--color" "bogus"))))
-    (check (= 1 (maxwell:main '("--no-such-option"))))))
+  ;; MAIN also picks AUTO colour from stdout, which may be a real terminal
+  ;; here, so the colour is put back the way it was for the caller.
+  (let ((color maxwell::*color*))
+    (let ((*error-output* (make-broadcast-stream)))
+      (check (= 1 (maxwell:main '("--color" "bogus"))))
+      (check (= 1 (maxwell:main '("--no-such-option")))))
+    (setf maxwell::*color* color)))
+
