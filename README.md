@@ -528,3 +528,81 @@ flag ends that wait instead of the turn, and the message is sent with the
 view built so far.
 
 
+
+## Named conversations
+
+A subagent is a conversation doing background work, not a separate agent type.
+Each has a stable ID and name, private chat/compaction state, its own model and
+effort, an inbox, and an optional parent. `main` adopts the existing chat without
+changing its message IDs. Selecting a conversation does not stop another one.
+
+```text
+/chat                        list conversations and work states
+/chat review                 select review's transcript and input
+/chat new review             create and select a fresh child
+/chat fork alternatives      create and select a fixed snapshot of this context
+/chat run review TASK        delegate work; return a non-waking result here
+/chat note review TEXT       leave a note; do not start a provider request
+/chat ask review TEXT        request work, starting at the next idle boundary
+/chat stop review            stop that conversation's worker
+```
+
+While a foreground turn runs, `/chat` commands also work at the steering prompt.
+Switch away and it continues. Switch back to inspect progress; a normal input
+line steers a running conversation, or starts its next turn when idle. `/model`
+and `/effort` apply to the selected conversation. Snapshots do not receive later
+parent messages. Notes enter the recipient's context at the start of its next
+turn, with sender and stable note ID; the inbox records the delivery message ID.
+A delegated result includes the child conversation's identity; its full transcript
+remains available rather than being automatically merged into the parent.
+
+The existing Lisp tool exposes the same primitives: `maxwell:create-conversation`,
+`start-conversation`, `stop-conversation`, `send-conversation`, and
+`find-conversation`. `start-conversation` accepts `:report-to` (a name or ID);
+`send-conversation` accepts `:wake t`. Roles and delegation policy belong in
+ordinary loaded Lisp. Message IDs are local to each conversation: bind
+`maxwell:*chat*` to its `conversation-chat` when using `zoom` or `date`.
+Request stats retain the originating conversation ID.
+
+**This separates context, not execution.** Workers share Lisp definitions and
+files. Do not concurrently reload or redefine shared code from several workers;
+use separate processes/worktrees for isolation. There is no automatic merging,
+pushing, role hierarchy, plugin framework, or task scheduler.
+
+## Verified restart and resume
+
+Use `/restart` for source changes that cannot safely be loaded into the current
+image (for example, changing a structure's slots). `/reload` remains available
+for compatible live edits.
+
+At an idle boundary, `/restart`:
+
+1. Saves the current runtime as the global image.
+2. Writes private, versioned conversation data: every chat, selected conversation,
+   parent relationships, client/model/effort settings, inbox delivery records,
+   drafts, and request stats.
+3. Builds and runs the Lisp tests in a separate process.
+4. Boots the candidate with `--verify-resume FILE` to read that exact state,
+   without taking the global lock or making provider requests.
+5. Keeps the previous executable image at `maxwell.image.rollback` (next to
+   `MAXWELL_IMAGE` when overridden), then execs the verified candidate with the
+   resume file. The candidate takes the global lock before opening the UI.
+
+A failed build or verification leaves the current process usable and the global
+image unchanged by the candidate. The replacement does not overwrite the global
+image until you checkpoint or quit it. For recovery, run the rollback image with
+`--fresh`; this restores the previous runtime and its saved conversations.
+Candidate executables and resume files remain beside the image for inspection;
+resume files are mode 0600 and executable images mode 0700. They contain private
+conversation data and should not be published.
+
+Restart and checkpoint refuse while conversations are running: stop them or wait
+for completion first. Interrupted tool calls are **never replayed** automatically.
+The versioned resume path migrates data into the fresh build; arbitrary live Lisp
+definitions are not transferred. Save/load those definitions as source, or use
+the retained rollback image to recover the complete old runtime. Normal image
+checkpoints still preserve the whole Lisp heap.
+
+Additional integration coverage: `python3 tests/conversations-pty.py` tests
+conversation switching during work, private context and effort, note delivery,
+delegated completion, multi-conversation checkpoints, and verified restart.

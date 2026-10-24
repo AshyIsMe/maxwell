@@ -19,6 +19,7 @@
   :components ((:file "src/package")
                (:file "src/json")
                (:file "src/threads")
+               (:file "src/conversation-state")
                (:file "src/stats")
                (:file "src/runtime")
                (:file "src/style")
@@ -34,8 +35,10 @@
                (:file "src/render")
                (:file "src/agent")
                (:file "src/terminal")
+               (:file "src/conversations")
                (:file "src/image")
-               (:file "src/cli"))
+               (:file "src/cli")
+               (:file "src/restart"))
   :build-operation "program-op"
   :build-pathname "maxwell"
   :entry-point "maxwell::image-main"
@@ -50,6 +53,7 @@
                (:file "tests/ui-tests")
                (:file "tests/memory-tests")
                (:file "tests/session-tests")
+               (:file "tests/conversation-tests")
                (:file "tests/tests"))
   :perform (test-op (operation component)
              (declare (ignore operation component))

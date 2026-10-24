@@ -41,6 +41,17 @@ image does when it resumes."
 ;;; The UI queue: a worker posts a thunk, and the UI thread runs it as soon as
 ;;; it is back in its polling loop, between keystrokes.
 
+(defvar *conversation* nil)
+(defvar *selected-conversation* nil)
+
+(defun conversation-visible-p ()
+  (or (null *conversation*) (eq *conversation* *selected-conversation*)))
+
+(defvar *ui-context-wrapper* nil)
+
+(defun wrap-ui-function (function)
+  (if *ui-context-wrapper* (funcall *ui-context-wrapper* function) function))
+
 (defvar *ui-queue* nil
   "Pending UI jobs, oldest first, guarded by *UI-QUEUE-LOCK*.")
 
@@ -63,7 +74,7 @@ it. For work nobody waits on, such as a streamed reasoning trace update."
       (progn (funcall function) t)
       (progn
         (bt:with-lock-held (*ui-queue-lock*)
-          (setf *ui-queue* (nconc *ui-queue* (list (%make-ui-job :function function)))))
+          (setf *ui-queue* (nconc *ui-queue* (list (%make-ui-job :function (wrap-ui-function function))))))
         t)))
 
 (defun ui-call (function)
@@ -78,7 +89,7 @@ a saved image that has resumed, the call runs where it is made rather than
 waiting for a thread that will never answer."
   (if (ui-thread-p)
       (funcall function)
-      (let ((job (%make-ui-job :function function :waiter (bt:current-thread))))
+      (let ((job (%make-ui-job :function (wrap-ui-function function) :waiter (bt:current-thread))))
         (bt:with-lock-held (*ui-queue-lock*)
           (setf *ui-queue* (nconc *ui-queue* (list job))))
         (bt:with-lock-held ((ui-job-lock job))
@@ -135,6 +146,7 @@ steering prompt's keystroke service, installed while a turn is in flight.")
   "What the UI thread does whenever it is free: run queued work, then service
 keystrokes if a turn is in flight."
   (drain-ui-queue)
+  (when (fboundp 'service-conversations) (service-conversations))
   (when *ui-service* (funcall *ui-service*)))
 
 (defun pump-ui ()
@@ -142,7 +154,7 @@ keystrokes if a turn is in flight."
 once; on a worker, the UI thread is asked and this thread waits for it."
   (if (ui-thread-p)
       (progn (service-ui) (sleep 0.02))
-      (ui-call #'service-ui)))
+      (ui-call #'drain-ui-queue)))
 
 (defun ui-yield (&optional (seconds 0.02))
   "Let the UI thread work: on a worker, sleep SECONDS so the UI thread can run
@@ -155,8 +167,8 @@ queued jobs; on the UI thread, run them instead."
   "Set the status bar's activity, on the UI thread when called from a worker:
 the bar is drawn there."
   (if (ui-thread-p)
-      (set-activity state detail)
-      (ui-post (lambda () (set-activity state detail)))))
+      (when (conversation-visible-p) (set-activity state detail))
+      (ui-post (lambda () (when (conversation-visible-p) (set-activity state detail))))))
 
 ;;; Workers. Every thread Maxwell starts is registered, so that a checkpoint
 ;;; can stop them all.

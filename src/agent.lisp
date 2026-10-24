@@ -58,7 +58,7 @@
 (defun invoke-model (agent)
   (ui-post-activity :thinking)
   ;; The live reasoning trace belongs to this request alone.
-  (ui-call #'hide-reasoning-trace)
+  (ui-call (lambda () (when (conversation-visible-p) (hide-reasoning-trace))))
   (unwind-protect
        (if (agent-model-function agent)
            (funcall (agent-model-function agent) (wire-messages agent)
@@ -67,7 +67,7 @@
                           (json-array (common-lisp-tool))))
     ;; The reply arrived, or the request failed: take the trace away, since the
     ;; model is done thinking.
-    (ui-call #'hide-reasoning-trace)
+    (ui-call (lambda () (when (conversation-visible-p) (hide-reasoning-trace))))
     (ui-post-activity :responding)))
 
 ;;; Logging
@@ -136,7 +136,9 @@ the model clip a very long result to its head and tail."
 and ends the process, and it may not happen beside worker threads. On a worker
 this does nothing, and the caller (RUN on the UI thread, or the interactive
 turn once its worker has ended) carries the request out later."
-  (when (and *pending-image* (ui-thread-p))
+  (when (and *pending-image* (ui-thread-p)
+             (not (and (boundp '*conversations*)
+                       (some #'conversation-running-p *conversations*))))
     (let ((path *pending-image*))
       (setf *pending-image* nil)
       ;; The snapshot ends the process, so the global chat is saved first.
@@ -184,19 +186,26 @@ guarded by *STEERING-LOCK*.")
   "Record TEXT as a steering prompt for the model's next request."
   (when (plusp (length (string-trim '(#\Space #\Tab) text)))
     (bt:with-lock-held (*steering-lock*)
-      (setf *steering* (append *steering* (list text))))
+      (if *conversation*
+          (setf (conversation-steering *conversation*)
+                (append (conversation-steering *conversation*) (list text)))
+          (setf *steering* (append *steering* (list text)))))
     ;; The steering line already echoed it.
     (record-entry :steer text :show nil))
   text)
 
 (defun steering-pending-p ()
   "True when a steering prompt is waiting to be delivered."
-  (bt:with-lock-held (*steering-lock*) (not (null *steering*))))
+  (bt:with-lock-held (*steering-lock*)
+    (not (null (if *conversation* (conversation-steering *conversation*) *steering*)))))
 
 (defun take-steering ()
   "Remove and return the queued steering prompts, oldest first."
   (bt:with-lock-held (*steering-lock*)
-    (prog1 *steering* (setf *steering* '()))))
+    (if *conversation*
+        (prog1 (conversation-steering *conversation*)
+          (setf (conversation-steering *conversation*) nil))
+        (prog1 *steering* (setf *steering* '())))))
 
 (defun inject-steering (agent)
   "Log queued steering prompts as :USER messages and append them to AGENT's
@@ -266,8 +275,8 @@ the chat lock."
 (defun set-busy-text (text)
   "Show TEXT, such as a spinner frame, before the steering prompt."
   (if (ui-thread-p)
-      (setf *busy-text* text)
-      (ui-post (lambda () (setf *busy-text* text)))))
+      (when (conversation-visible-p) (setf *busy-text* text))
+      (ui-post (lambda () (when (conversation-visible-p) (setf *busy-text* text))))))
 
 (defun await-summaries (agent id)
   "Wait until every message before ID is summarized, so the view shows the
@@ -342,10 +351,12 @@ thread must never be asked for something while the chat lock is held."
 (defun turn-state (agent)
   "The turn's date, workspace, and model, as the head of the user's message.
 It changes every turn, so it comes after the view, never in the system prompt."
-  (format nil "Date: ~A~%Workspace: ~A~%Model: ~A"
+  (format nil "Date: ~A~%Workspace: ~A~%Model: ~A~@[~%Conversation: ~A~]"
           (iso-8601 (get-universal-time))
           (namestring (agent-workspace agent))
-          (client-model (agent-client agent))))
+          (client-model (agent-client agent))
+          (and *conversation* (format nil "~A (#~D)" (conversation-name *conversation*)
+                                      (conversation-id *conversation*)))))
 
 (defun turn-history (agent chat id prompt)
   "The start of the history for a turn on message ID: the view of every
@@ -395,7 +406,7 @@ or a test, where there is no UI thread to keep free."
                                    (list (execute-tool-call agent call))))
                      ;; The compactor has a worker of its own at the prompt, so this
                      ;; only advances it where there is none: a one-shot run or a test.
-                     (unless (compactor-worker-live-p) (tick-compactor agent)))
+                     (when (or *conversation* (not (compactor-worker-live-p))) (tick-compactor agent)))
             ;; A prompt typed while the model was answering continues the turn.
             (unless (steering-pending-p)
               (finish-pending-image)
@@ -452,7 +463,9 @@ BINDINGS, an alist of (SPECIAL . VALUE), reach the worker too."
          ;; worker takes from the same place, so a prompt typed during the
          ;; turn reaches the model. Anything left over is dropped.
          (bindings (append bindings
-                           (list (cons '*chat* *chat*)
+                           (list (cons '*conversation* *conversation*)
+                                  (cons '*ui-context-wrapper* *ui-context-wrapper*)
+                                  (cons '*chat* *chat*)
                                  (cons '*agent* agent)
                                  (cons '*session-entries* *session-entries*)
                                  (cons '*show-entries* print-response)
@@ -463,6 +476,9 @@ BINDINGS, an alist of (SPECIAL . VALUE), reach the worker too."
           (start-worker "maxwell turn"
                         (lambda () (turn-main turn prompt agent print-response))
                         :bindings bindings))
+    (when *conversation*
+      (setf (conversation-turn *conversation*) turn
+            (conversation-state *conversation*) :running))
     turn))
 
 (defun cancel-turn (turn)
@@ -481,10 +497,13 @@ whatever it already logged. Returns true when there was a turn to cancel."
 and the compactor all run here while the turn's worker does the real work.
 Ctrl-C cancels the turn there. Returns the reply; re-signals the error the
 turn ended with, if any."
-  (let ((*current-turn* turn))
+  (let ((*current-turn* turn)
+        (origin *conversation*))
     (unwind-protect
          (progn
-           (loop until (turn-done turn)
+           (loop until (or (turn-done turn)
+                                 (and origin
+                                      (not (eq origin *selected-conversation*))))
                  do (when (and (not (summary-waiting-p)) (take-interrupt))
                       (record-entry :status "Interrupted." :ok-p nil :show t)
                       (cancel-turn turn))
@@ -493,7 +512,7 @@ turn ended with, if any."
            (when (turn-condition turn) (error (turn-condition turn)))
            (turn-result turn))
       ;; A turn interrupted from outside still may run cleanup on its worker.
-      (when (and (turn-worker turn) (worker-alive-p (turn-worker turn)))
+      (when (and (turn-done turn) (turn-worker turn) (worker-alive-p (turn-worker turn)))
         (ignore-errors (worker-join (turn-worker turn)))))))
 
 

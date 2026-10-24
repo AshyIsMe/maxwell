@@ -29,6 +29,8 @@ RESET-TRANSCRIPT empties it at startup and when an image resumes.")
   "How tool calls are drawn: :summary (one header line and the last result
 lines) or :full (all code and the whole result). Ctrl-T switches it.")
 
+(defvar *ui-input-hide* nil)
+
 (defvar *show-entries* nil
   "True while recorded entries are printed as they arrive. RUN binds it from
 its :PRINT-RESPONSE argument.")
@@ -82,13 +84,16 @@ older than the session.")
                     :output :string :error-output :string))
 
 (defun terminal-size ()
-  "The terminal's rows and columns, or 24 and 80 when they are unknown."
+  "The terminal's rows and columns, or 24 and 80 when they are unknown.
+A pseudo-terminal that was given no size reports 0 0, which STTY accepts,
+so a size that is not positive counts as unknown too."
   (let ((size (ignore-errors
                 (mapcar #'parse-integer
-                        (remove "" (uiop:split-string (terminal-command "size"))
-                                :test #'string=)))))
-    (values (max 3 (or (first size) 24))
-            (max 2 (or (second size) 80)))))
+                        (remove "" (uiop:split-string (terminal-command "size")
+                                :test #'string=))))))
+    (flet ((known (value fallback) (if (and value (plusp value)) value fallback)))
+      (values (max 3 (known (first size) 24))
+              (max 2 (known (second size) 80))))))
 
 (defun live-width (stream)
   "The width to render rows at on STREAM: one less than the terminal's columns,
@@ -324,7 +329,8 @@ thought hidden by default, prints nothing at all."
           ;; The status bar and the steering line must go away before the
           ;; transcript grows.
           (status-bar-hide stream)
-          (when *input-hide* (funcall *input-hide*))
+          (let ((hide (or *ui-input-hide* *input-hide*)))
+            (when hide (funcall hide)))
           (write-rows rows stream))))))
 
 (defun print-entry (entry &optional (stream *standard-output*))
@@ -338,7 +344,7 @@ thought hidden by default, prints nothing at all."
     (when (and (eq kind :echo) (plusp (length entries)))
       (remhash (aref entries (1- (length entries))) *row-cache*))
     (vector-push-extend entry entries)
-    (when show (show-entry entries (1- (length entries)) stream))
+    (when (and show (conversation-visible-p)) (show-entry entries (1- (length entries)) stream))
     entry))
 
 (defun record-entry (kind text &key (ok-p t) id (show nil show-p)
@@ -555,3 +561,4 @@ prompt line afterwards."
         (write-line (styled :dim "… earlier history: PgUp") output))
       (dolist (line lines) (write-line line output))
       (finish-output output))))
+

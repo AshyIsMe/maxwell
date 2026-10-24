@@ -19,7 +19,11 @@
                 #:json-object
                 #:json-array
                 #:+null+)
-  (:export #:main
+  (:export #:create-conversation #:find-conversation #:select-conversation
+           #:start-conversation #:stop-conversation #:send-conversation
+           #:conversation-id #:conversation-name #:conversation-state
+           #:conversation-chat #:conversation-inbox
+           #:main
            #:run
            #:make-agent
            #:make-client

@@ -56,7 +56,8 @@ reuses the provider and model of the previous session, remembered in
     (:auth-provider "-a" "--auth") (:login-provider "--login")
     (:logout-provider "--logout") (:header "-H" "--header")
     (:request-json "--request-json") (:workspace "-C" "--workspace")
-    (:prompt "-p" "--print") (:color "--color"))
+    (:prompt "-p" "--print") (:color "--color")
+     (:resume-state "--resume-state") (:verify-resume "--verify-resume"))
   "Options that take a value: the key PARSE-OPTIONS returns it under, then
 the option's spellings.")
 
@@ -442,6 +443,19 @@ default."
                 (or (set-effort client argument) "the provider's default")))))
 
 (defun run-interactive-turn (line agent)
+  (if (null *conversation*)
+      (%run-interactive-turn line agent)
+      (let ((origin *selected-conversation*))
+        (unwind-protect
+             (let ((*conversation* origin)
+                   (*ui-context-wrapper* (conversation-ui-wrapper origin)))
+               (deliver-conversation-notes origin)
+               (when (conversation-running-p origin) (queue-steering line))
+               (%run-interactive-turn line agent))
+          (select-conversation (conversation-name *selected-conversation*) :draw nil)
+          (service-conversations)))))
+
+(defun %run-interactive-turn (line agent)
   "Run LINE on a worker thread, keeping the prompt live on this, the UI,
 thread: the user can browse the transcript and queue steering prompts, and
 Ctrl-C cancels the turn. The compactor has a worker of its own."
@@ -458,23 +472,29 @@ Ctrl-C cancels the turn. The compactor has a worker of its own."
                            ;; The steering line is drawn on the UI thread, and the
                            ;; worker hides it from ITS thread when the output
                            ;; starts, so the hide is handed over.
-                           (*input-hide* (lambda () (ui-call (lambda () (steering-hide session)))))
+                           (*input-hide* (lambda () (ui-call (lambda ()
+                              (when (conversation-visible-p) (steering-hide session))))))
                            ;; A streamed reasoning trace shows while the model
                            ;; thinks, and the UI thread redraws it.
                            (*reasoning-delta-function* #'note-live-reasoning)
-                           (turn (start-turn line :agent agent :print-response t
+                           (turn (or (and *conversation* (conversation-running-p *conversation*)
+                                           (conversation-turn *conversation*))
+                                     (start-turn line :agent agent :print-response t
                                                         :bindings
                                                         (list (cons '*input-hide*
                                                                     *input-hide*)
                                                               (cons '*reasoning-delta-function*
-                                                                    #'note-live-reasoning)))))
+                                                                    #'note-live-reasoning))))))
                       (setf (steering-session-turn session) turn)
                       ;; Keystrokes and queued work come to the UI thread here.
-                      (let ((*ui-service* (lambda () (service-steering-input session))))
+                      (let ((*ui-service* (lambda () (service-steering-input session)))
+                             (*ui-input-hide* (lambda () (steering-hide session))))
                         (unwind-protect (await-turn turn)
                           (steering-hide session)
                           ;; An unfinished steering line becomes the next prompt.
-                          (setf *prompt-draft* (steering-draft session))
+                          (if *conversation*
+                               (setf (conversation-draft *conversation*) (steering-draft session))
+                               (setf *prompt-draft* (steering-draft session)))
                           ;; A turn that asked for an image gets it now that its
                           ;; worker has ended: the save cannot run beside threads.
                           (when (pending-image-pending-p) (finish-pending-image))))))
@@ -539,7 +559,12 @@ QUIET. True unless saving failed."
 /stats         show recent request timings and a tokens-weighted summary
 /import PATH   read a file into memory as a note
 /checkpoint    save the chat to the global image and keep going
-/reload        load Maxwell's source into this session, then save
+/chat          list conversations; /chat NAME selects one
+/chat new NAME fresh child; /chat fork NAME snapshots the selected context
+/chat run NAME TASK delegate; /chat note NAME TEXT leaves a non-waking note
+/chat ask NAME TEXT requests work; /chat stop NAME cancels work
+/restart       build, test, verify saved conversations, then restart with rollback
+/reload        live-load compatible source changes, then save
 /save PATH     save a separate resumable image and exit
 /quit          save the chat and exit (Ctrl-D too)
 Editing: Up/Down history; Ctrl-A/E line ends; Ctrl-U/W/K kill; Ctrl-Y yank.
@@ -568,7 +593,11 @@ before its next request.")
   "The function the compactor's worker calls: it advances AGENT's background
 compaction in CHAT on the worker, which is a thread of its own. CHAT is taken
 now, because a worker inherits no dynamic bindings."
-  (lambda () (tick-compactor agent chat)))
+  (lambda ()
+    (if *conversations*
+        (dolist (conversation (copy-list *conversations*))
+          (tick-compactor (conversation-agent conversation) (conversation-chat conversation)))
+        (tick-compactor agent chat))))
 
 (defun start-background-work (agent)
   "Start what runs beside the prompt: the compactor's worker and the Ctrl-C
@@ -583,6 +612,7 @@ handler. The UI thread has already been claimed by MAIN."
 (defun interactive-loop (&optional (agent *agent*))
   (setf *agent* (or agent (make-agent)))
   (unless *chat* (setf *chat* (make-chat)))
+  (ensure-conversations *agent*)
   (start-background-work *agent*)
   (let ((start (with-chat-lock (chat-message-count *chat*))))
     (setf *older-entries-function* (older-log-entries *chat* start))
@@ -602,6 +632,12 @@ handler. The UI thread has already been claimed by MAIN."
       (cond
         ((or (null line) (command-p line "/quit") (command-p line "/exit"))
          (return (if (save-session) 0 1)))
+        ((or (command-p line "/chat") (command-argument line "/chat "))
+         (handler-case (conversation-command (or (command-argument line "/chat ") ""))
+           (error (e) (report-error "~A" e))))
+        ((command-p line "/restart")
+         (handler-case (restart-command)
+           (error (e) (report-error "Restart failed; current session retained: ~A" e))))
         ((command-p line "/help")
          (write-line (style-lines :dim *help-text*)))
         ((or (command-p line "/login") (command-p line "/logout"))
@@ -687,7 +723,7 @@ the global image's process takes the lock and saves itself when it ends.
           *checkpoint-path* nil)
     (cond
       ((getf options :ephemeral)
-       (setf *chat* (make-chat)))
+       (setf *chat* (make-chat) *conversations* nil *selected-conversation* nil *conversation* nil))
       (t
        (unless (or (getf options :fresh) (getf options :adopt-chat)
                    (running-global-image-p image))
@@ -755,7 +791,9 @@ remembered session."
   "--print: run PROMPT, then save the chat. Returns the exit status."
   (let ((warning (compact-model-warning (agent-client agent))))
     (when warning (format *error-output* "~&~A~%" (styled :dim warning))))
-  (let ((status (handler-case (progn (run prompt :agent agent) 0)
+  (let* ((*ui-context-wrapper* (and *conversation* (conversation-ui-wrapper *conversation*)))
+         (status (handler-case (progn (deliver-conversation-notes *conversation*)
+                                            (run prompt :agent agent) 0)
                   (error (condition)
                     (report-error "maxwell: ~A" condition)
                     1))))
@@ -775,6 +813,9 @@ compaction run on workers of their own."
         (when (getf options :color) (configure-color (getf options :color)))
         (cond
           ((getf options :help) (usage) 0)
+          ((getf options :verify-resume)
+           (read-resume-state (getf options :verify-resume))
+           (format t "Verified ~D conversations.~%" (length *conversations*)) 0)
           ((getf options :export-chat) (export-chat) 0)
           ((getf options :logout-provider)
            (logout (getf options :logout-provider))
@@ -787,10 +828,19 @@ compaction run on workers of their own."
            0)
           (t
            (open-global-chat options arguments)
+           (when (getf options :resume-state)
+             (read-resume-state (getf options :resume-state)))
            (if (getf options :adopt-chat)
                (adopt-global-chat)
                (let ((agent (make-session-agent options)))
+                 (when *conversations*
+                   (let ((selected (or *selected-conversation* (first *conversations*))))
+                     (when (or (getf options :model) (getf options :auth-provider)
+                               (getf options :base-url) (getf options :workspace))
+                       (setf (conversation-agent selected) agent))
+                     (setf agent (conversation-agent selected))))
                  (setf *agent* agent)
+                 (ensure-conversations agent)
                  (if (getf options :prompt)
                      (run-once (getf options :prompt) agent)
                      (interactive-loop agent)))))))
@@ -806,6 +856,7 @@ MAIN on the command line and exit with its status."
   ;; and the queues start empty. A saved chat keeps its own compaction, so
   ;; the new session installs its own tick in START-BACKGROUND-WORK.
   (release-ui-thread)
+  (reset-conversation-runtime)
   (setf *workers* '()
         *compactor-worker* nil
         *compactor-tick* nil
