@@ -63,8 +63,8 @@ thinks. Returns the trace so far."
 that runs the request; the trace is drawn by the UI thread, so a worker's piece
 is handed over to it."
   (if (ui-thread-p)
-      (%note-live-reasoning text)
-      (progn (ui-post (lambda () (%note-live-reasoning text)))
+      (when (conversation-visible-p) (%note-live-reasoning text))
+      (progn (ui-post (lambda () (when (conversation-visible-p) (%note-live-reasoning text))))
              *live-reasoning*)))
 
 (defun hide-reasoning-trace ()

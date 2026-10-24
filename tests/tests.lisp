@@ -990,7 +990,10 @@
 
 (defun run-tests ()
   ;; Tests may be run by the live agent through COMMON_LISP.
-  (let ((maxwell:*agent* nil)
+  (let ((maxwell::*conversations* nil)
+        (maxwell::*conversation* nil) (maxwell::*selected-conversation* nil)
+        (maxwell::*ui-context-wrapper* nil)
+        (maxwell:*agent* nil)
         ;; Nor touch the live session's transcript or display settings.
         (maxwell::*session-entries* (maxwell::make-entry-vector))
         (maxwell::*tool-display* :summary)
@@ -1018,6 +1021,7 @@
                            (uiop:temporary-directory))))
     (setf *failures* 0)
     (test-json)
+    (test-conversations)
     (test-json-key-case)
     (test-eval)
     (test-vendored-libraries)

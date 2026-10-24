@@ -290,7 +290,8 @@ and Ctrl-A/E/B/F/U/W/K/Y/L edit the line. IDLE, when given, is called while
 no key arrives, so background work such as compaction continues."
   (declare (ignorable agent))
   (set-activity :idle)
-  (let ((editor (make-prompt-editor agent input output :text *prompt-draft*)))
+  (let* ((editor (make-prompt-editor agent input output :text *prompt-draft*))
+         (*ui-input-hide* (lambda () (editor-erase editor))))
     (setf *prompt-draft* "")
     (editor-redraw editor)
     (loop
@@ -300,7 +301,9 @@ no key arrives, so background work such as compaction continues."
         (setf (prompt-editor-text editor) ""
               (prompt-editor-cursor editor) 0
               (prompt-editor-index editor) 0))
-      (let* ((key (progn (await-key input (or idle #'drain-ui-queue))
+      (let* ((key (progn (await-key input (lambda ()
+                            (funcall (or idle #'drain-ui-queue))
+                            (editor-redraw editor)))
                          (terminal-key input)))
              (action (editor-key editor key)))
         (case action
@@ -356,8 +359,14 @@ while the model thinks, the live reasoning trace."
     (setf (steering-session-shown session) nil)
     (when (plusp (length (string-trim '(#\Space #\Tab) text)))
       (remember-prompt text)
-      (queue-steering text)
-      (show-entry *session-entries* (1- (length *session-entries*)) output))))
+      (if (and *conversation* (or (string= text "/chat")
+                                      (and (>= (length text) 6) (string= text "/chat " :end1 6))))
+          (handler-case (let ((*conversation* *conversation*) (*chat* *chat*)
+                             (*agent* *agent*) (*session-entries* *session-entries*))
+                          (conversation-command (if (> (length text) 5) (subseq text 6) "")))
+            (error (e) (record-entry :status (princ-to-string e) :show t)))
+          (progn (queue-steering text)
+                 (show-entry *session-entries* (1- (length *session-entries*)) output))))))
 
 (defun service-steering-input (session)
   "Handle keystrokes waiting while the model works. Returns T when any arrived.
@@ -396,10 +405,12 @@ afterwards. Runs on the UI thread."
                         (steering-hide session)
                         (record-entry :status "Interrupted." :ok-p nil :show t)))
                      (otherwise nil)))))
-    (if handled
+    (if (and *conversation* (not (eq *conversation* *selected-conversation*)))
+        (steering-hide session)
+        (if handled
         (progn (editor-redraw editor)
                (setf (steering-session-shown session) t))
-        (steering-show session))
+        (steering-show session)))
     handled))
 
 (defun read-interactive-prompt (agent)
@@ -421,7 +432,7 @@ runs work queued by workers while it waits."
                ;; work queued by workers -- and a cancelled turn's worker may still
                ;; be recording what it did.
                (read-terminal-prompt agent *standard-input* *standard-output*
-                                     :idle #'drain-ui-queue))
+                                     :idle #'conversation-idle))
           (terminal-command state))
         (progn
           (format t "~&maxwell> ")

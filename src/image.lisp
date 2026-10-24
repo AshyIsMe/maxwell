@@ -104,6 +104,9 @@ vectors are emptied in place, because a turn may have them bound."
   (setf (fill-pointer *session-entries*) 0)
   (clear-row-cache)
   (when *agent* (setf (agent-history *agent*) '()))
+  (dolist (c *conversations*)
+    (setf (agent-history (conversation-agent c)) nil)
+    (compactor-drain (conversation-chat c) 0))
   (when *chat* (compactor-drain *chat* 0)))
 
 (defun fsync-path (path)
@@ -180,6 +183,8 @@ Use maxwell:request-image to have the turn save an image when it ends."))
   (%checkpoint image))
 
 (defun %checkpoint (image)
+  (when (some #'conversation-running-p *conversations*)
+    (error "Stop running conversations before checkpointing; their tools cannot be replayed safely."))
   (set-activity :saving)
   ;; A checkpoint is a safe boundary for workers: stop them before the fork, and
   ;; start the compactor again when the fork is over.
@@ -347,6 +352,8 @@ load fails."
 
 
 (defun %save-image (path executable)
+  (when (some #'conversation-running-p *conversations*)
+    (error "Stop running conversations before saving an image."))
   ;; A worker cannot stop itself before SBCL saves the heap.
   (unless (ui-thread-p)
     (error "Save images on the UI thread; use maxwell:request-image in a tool."))

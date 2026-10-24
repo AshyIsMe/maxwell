@@ -29,6 +29,8 @@ RESET-TRANSCRIPT empties it at startup and when an image resumes.")
   "How tool calls are drawn: :summary (one header line and the last result
 lines) or :full (all code and the whole result). Ctrl-T switches it.")
 
+(defvar *ui-input-hide* nil)
+
 (defvar *show-entries* nil
   "True while recorded entries are printed as they arrive. RUN binds it from
 its :PRINT-RESPONSE argument.")
@@ -324,7 +326,8 @@ thought hidden by default, prints nothing at all."
           ;; The status bar and the steering line must go away before the
           ;; transcript grows.
           (status-bar-hide stream)
-          (when *input-hide* (funcall *input-hide*))
+          (let ((hide (or *ui-input-hide* *input-hide*)))
+            (when hide (funcall hide)))
           (write-rows rows stream))))))
 
 (defun print-entry (entry &optional (stream *standard-output*))
@@ -338,7 +341,7 @@ thought hidden by default, prints nothing at all."
     (when (and (eq kind :echo) (plusp (length entries)))
       (remhash (aref entries (1- (length entries))) *row-cache*))
     (vector-push-extend entry entries)
-    (when show (show-entry entries (1- (length entries)) stream))
+    (when (and show (conversation-visible-p)) (show-entry entries (1- (length entries)) stream))
     entry))
 
 (defun record-entry (kind text &key (ok-p t) id (show nil show-p)

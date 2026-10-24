@@ -22,10 +22,13 @@ MAXWELL_STATS_DAYS, otherwise 30.")
   "The most request records kept in *REQUEST-STATS*: a hard ceiling on top of
 the retention time, so an extremely busy month cannot grow without bound.")
 
+(defvar *request-stats-lock* (bt:make-recursive-lock "maxwell stats"))
+
 (defvar *request-stats* '()
   "Newest-first list of REQUEST-STAT records, one per measured model request.")
 
 (defstruct request-stat
+  conversation-id
   model
   wire-api
   started          ; universal time of the request
@@ -45,7 +48,8 @@ the retention time, so an extremely busy month cannot grow without bound.")
 
 (defun request-stat-begin (model wire-api &key (time (get-universal-time)))
   "Start measuring a request to WIRE-API for MODEL."
-  (make-request-stat :model model :wire-api wire-api :started time
+  (make-request-stat :conversation-id (and *conversation* (conversation-id *conversation*))
+                     :model model :wire-api wire-api :started time
                      :real-start (get-internal-real-time)))
 
 (defun note-request-piece (stat size)
@@ -140,8 +144,9 @@ tokens when the provider reported no usage."
             (setf (request-stat-completion-tokens stat) (ceiling size 4)
                   (request-stat-estimated stat) t))))
       (request-stat-finish-tokens stat)
-      (push stat *request-stats*)
-      (expire-request-stats))
+      (bt:with-recursive-lock-held (*request-stats-lock*)
+        (push stat *request-stats*)
+        (expire-request-stats)))
     stat))
 
 (defun request-stats-cutoff (&key (time (get-universal-time)))
@@ -151,6 +156,7 @@ tokens when the provider reported no usage."
 (defun expire-request-stats (&key (time (get-universal-time)))
   "Drop records older than the retention time, then any beyond the ceiling.
 *REQUEST-STATS* is newest first, so old records sit at its end."
+  (bt:with-recursive-lock-held (*request-stats-lock*)
   (let ((cutoff (request-stats-cutoff :time time)))
     (setf *request-stats*
           (remove-if (lambda (stat)
@@ -159,11 +165,14 @@ tokens when the provider reported no usage."
                      *request-stats*)))
   (when (> (length *request-stats*) *request-stats-limit*)
     (setf *request-stats* (subseq *request-stats* 0 *request-stats-limit*)))
-  *request-stats*)
+  *request-stats*))
 
 (defun latest-request-stat ()
   "The most recent request record, or NIL."
-  (first *request-stats*))
+  (bt:with-recursive-lock-held (*request-stats-lock*)
+    (if *conversation*
+        (find (conversation-id *conversation*) *request-stats* :key #'request-stat-conversation-id)
+        (first *request-stats*))))
 
 ;;; Reporting
 
@@ -179,8 +188,9 @@ never shown."
 
 (defun request-stat-line (stat)
   "One line describing STAT."
-  (format nil "~A  ~@[first token ~,2Fs, ~]total ~,2Fs~@[  ~,1F tok/s~]~@[  ~:D in +~]~@[ ~:D out~]~@[ (incl. ~:D reasoning)~]~@[  = ~:D tokens~]~:[~;  (estimated)~]"
+  (format nil "~A~@[ [conversation ~D]~]  ~@[first token ~,2Fs, ~]total ~,2Fs~@[  ~,1F tok/s~]~@[  ~:D in +~]~@[ ~:D out~]~@[ (incl. ~:D reasoning)~]~@[  = ~:D tokens~]~:[~;  (estimated)~]"
           (request-stat-model-name stat)
+          (request-stat-conversation-id stat)
           (request-stat-latency stat)
           (request-stat-total stat)
           (request-stat-tokens-per-second stat)
